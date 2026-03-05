@@ -1,19 +1,20 @@
 /* Rules to keep in mind:
-  1. Scheduling can only occur when: IRQL < DISPATCH_LEVEL
-  2. DPC runs at DISPATCH_LEVEL and blocks scheduling.
-  3. Timer interrupt drives quantum expiration.
-  4. ISR cannot directly switch threads.
-     It must: Queue DPC and DPC performs scheduling work
+   1. Scheduling can only occur when: IRQL < DISPATCH_LEVEL
+   2. DPC runs at DISPATCH_LEVEL and blocks scheduling.
+   3. Timer interrupt drives quantum expiration.
+   4. ISR cannot directly switch threads.
+   It must: Queue DPC and DPC performs scheduling work
 
-     Now after thrid session we have came across Priority inversion.
-    Priority inversion exists if:
-    1. A high-priority thread `H` is Blocked
-    2. It is blocked on a mutex owned by `L` (low-priority thread)
-    3. There exists a READY/RUNNING thread `M` (Midum-priority thread)
-    4. priority(M) > Priority(L)
-    If all four are true -> inversion is active.
-    This is exactly the scenario that caused the failure on the <Mars Pathfinder>.
- */
+   Now after thrid session we have came across Priority inversion.
+   Priority inversion exists if:
+   1. A high-priority thread `H` is Blocked
+   2. It is blocked on a mutex owned by `L` (low-priority thread)
+   3. There exists a READY/RUNNING thread `M` (Midum-priority thread)
+   4. priority(M) > Priority(L)
+   If all four are true -> inversion is active.
+   This is exactly the scenario that caused the failure on the <Mars Pathfinder>.
+   We successfully prevent Priority inversion.
+*/
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -208,8 +209,8 @@ void device_isr(){
     //we are treating odd memory address as pageable 
     /*
       access_memory((void *)3);
-    // We get Page fault at elevated IRQL 
-    */
+      // We get Page fault at elevated IRQL 
+      */
     queue_dpc(device_dpc);
 }
 
@@ -250,6 +251,7 @@ typedef struct _THREAD{
     int id;
     int pc; //simulated instruction pointer
     int priority;
+    int base_priority;
     int quantum;
     THREAD_STATE state;
     ThreadRoutine tRoutine;
@@ -266,6 +268,7 @@ void CreateThread(ThreadRoutine tdR, int priority){
     THREAD *t = &thread_table[thread_count++];
     t->id = thread_count;
     t->priority = priority;
+    t->base_priority = priority;
     t->quantum = 3;
     t->state = THREAD_READY;
     t->tRoutine = tdR;
@@ -315,12 +318,11 @@ void CheckPreemption(THREAD *newThread){
         if(cpu.current_irql < DISPATCH_LEVEL){
             printf("Immediate preemption: T%d -> T%d\n",
                    current_thread->id, newThread->id);
-            Schedule();
         }else{
             printf("Preemption defferred (IRQL %d)\n",
-                   cpu.current_irql);
-            reschedule_requested = 1;
+                   cpu.current_irql);  
         }
+        reschedule_requested = 1;
     }
 }
 
@@ -397,13 +399,29 @@ void AcquireMutex(MUTEX *m){
     }
 
     printf("Thread %d blocking on mutex.\n", current_thread->id);
-
+    
+    THREAD *owner = m->owner;
+    if(owner && owner->priority < current_thread->priority){
+        printf("Priority inheritance: Boosting T%d from %d to %d\n",
+               owner->id,
+               owner->priority,
+               current_thread->priority);
+        
+        owner->priority = current_thread->priority;
+    }
     BlockCurrentThread(&m->waiters);
 }
 
 void ReleaseMutex(MUTEX *m){
     if(m->owner != current_thread)
         KernelBugcheck("Mutex released by non-owner");
+
+    printf("Restoring T%d priority from %d to base %d\n",
+           current_thread->id,
+           current_thread->priority,
+           current_thread->base_priority);
+
+    current_thread->priority = current_thread->base_priority;
 
     if(m->waiters.count == 0){
         m->locked = 0;
@@ -425,12 +443,7 @@ void WakeOne(WAIT_QUEUE *queue){
 
     if(queue->count == 0)
         return;
-
-    /* THREAD *t = queue->threads[0]; */
-    /* for(int i = 1; i < queue->count; i++){ */
-    /*     queue->threads[i - 1] = queue->threads[i]; */
-    /* } */
-    /* queue->count--; */
+    
     THREAD *t = DequeueHighestPriority(queue);
 
     t->state = THREAD_READY;
@@ -552,8 +565,6 @@ void Thread_A(THREAD *t){
         case 1:{
             puts("Step 2");
             t->pc = 2;
-            /* StartIoOperation(); */
-            /* WaitEvent(&io_event); */
             return;
         }
         case 2:{
@@ -599,6 +610,7 @@ void Thread_L(THREAD *t){
         }
         case 1:{
             puts("L: Holding mutex (long work)");
+            t->pc = 2;
             return;
         }
         case 2:{
@@ -621,8 +633,10 @@ void Thread_H(THREAD *t){
         }
         case 1:{
             puts("H: Acquired mutex");
+            puts("H: DONE it's work");
             ReleaseMutex(&test_mutex);
             t->state = THREAD_TERMINATED;
+            t->pc = 2;
             reschedule_requested = 1;
             return;
         }
@@ -630,8 +644,18 @@ void Thread_H(THREAD *t){
 }
 
 void Thread_M(THREAD *t){
-    (void)t;
-    puts("M: running independent work.");
+    switch(t->pc){
+        case 0:{
+            puts("M: running independent work.");
+            t->pc = 1;
+            return;
+        }
+        case 1:{
+            puts("M: running independent work.");
+            t->state = THREAD_TERMINATED;
+            return;
+        }       
+    }
 }
 
 int main(){
@@ -665,10 +689,7 @@ int main(){
     
     CreateThread(Thread_M, 3);  // Medium
     CreateThread(Thread_H, 5);  //high
-
-    
     InitEvent(&io_event);
-    /* Schedule(); */
     
     INTERRUPT timer_interrupt = {
         .irql = DIRQL,
