@@ -55,7 +55,7 @@ void AccessMemory(void *address){
     printf("Memory accessed safely at IRQL %d\n", cpu.current_irql);
 }
 
-//Deffered Procedure Calls at Dispatch Level 
+//Deferred Procedure Calls at Dispatch Level 
 typedef void (*DPC_ROUTINE)(void);
 
 typedef struct _DPC{
@@ -81,7 +81,7 @@ void QueueDpc(DPC_ROUTINE routine){
 void DrainDpcQueue(){
     if(cpu.current_irql != DISPATCH_LEVEL)
         return;
-    puts("Drainig DPC queue...");
+    puts("Draining DPC queue...");
     while(dpc_count > 0){
         DPC_ROUTINE routine = dpc_queue[dpc_head].routine;
         dpc_head = (dpc_head + 1) % MAX_QUEUE;
@@ -109,21 +109,24 @@ void PopIrql(){
         KernelBugcheck("IRQL stack underflow");
 
     IRQL old_level = cpu.current_irql;
+    IRQL new_level;
 
     irql_top--;
 
     if(irql_top >= 0)
-        cpu.current_irql = irql_stack[irql_top];
+        new_level = irql_stack[irql_top];
     else
-        cpu.current_irql = PASSIVE_LEVEL;
+        new_level = PASSIVE_LEVEL;
+
+    cpu.current_irql = new_level;
 
     printf("IRQL popped -> %d\n", cpu.current_irql);
 
-    if(old_level > DISPATCH_LEVEL && cpu.current_irql < DISPATCH_LEVEL){
+    if(old_level > DISPATCH_LEVEL && new_level < DISPATCH_LEVEL){
         cpu.current_irql = DISPATCH_LEVEL;
         DrainDpcQueue();
-        cpu.current_irql = PASSIVE_LEVEL;
-    }   
+        cpu.current_irql = new_level;
+    }
 }
 
 typedef void (*ISR_ROUTINE)(void);
@@ -134,7 +137,7 @@ typedef struct _INTERRUPT{
 } INTERRUPT;
 
 void TriggerInterrupt(INTERRUPT *interrupt){
-    if(irql_top >= 0 && interrupt->irql <= cpu.current_irql){
+    if(interrupt->irql <= cpu.current_irql){
         printf("Interrupt masked (IRQL %d)\n", interrupt->irql);
         return;
     }
@@ -546,7 +549,7 @@ void ReleaseMutex(MUTEX *m){
     CheckPreemption(next);
 }
 
-void DestoryProcess(PROCESS *p){
+void DestroyProcess(PROCESS *p){
     for(int i = 0; i < MAX_HANDLES; i++){
         if(p->handle_table[i]){
             ObDereferenceObject(p->handle_table[i]);
@@ -787,7 +790,7 @@ void Thread_M(THREAD *t){
         }
         case 1:{
             puts("M: running independent work.");
-            t->state = THREAD_TERMINATED;
+            TerminateThread(t);
             return;
         }       
     }
@@ -857,7 +860,7 @@ int main(){
     
         if(user->exist && !ProcessHasLiveThreads(user)){
             printf("Process %d exiting( All Threads terminated).\n", user->pid);
-            DestoryProcess(user);
+            DestroyProcess(user);
         }
     }
     puts("\nBack to PASSIVE_LEVEL");
