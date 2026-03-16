@@ -1,3 +1,6 @@
+#Change source variable for to run different kernel lvl
+# BlueKernel_Lvl1.c, BlueKernel_lvl2.c, BlueKernel_lvl3.c
+# Each level is show you journey of kernel creation
 
 CC = gcc
 CFLAGS = -Wall -Werror -Wextra
