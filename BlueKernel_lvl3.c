@@ -40,7 +40,7 @@ CPU cpu = {PASSIVE_LEVEL};
 
 //Simulated BugCheck
 void KernelBugcheck(const char *reason){
-    puts("\n*** KERNEL BUGCHECK ***");
+    printf("\n \x1b[31m[KERNEL BUGCHECK]\x1b[0m");
     printf("Reason: %s\n", reason);
     exit(1);
 }
@@ -217,7 +217,7 @@ typedef void (*ThreadRoutine)(THREAD *);
 
 typedef struct _THREAD{
     int id;
-    int pc;
+    int pc; 
     int priority;
     int base_priority;
     int quantum;
@@ -225,10 +225,11 @@ typedef struct _THREAD{
     ThreadRoutine tRoutine;
     PROCESS *owner;
     MUTEX *owned_mutex;
+    MUTEX *waiting_mutex;
 } THREAD;
 
-THREAD thread_table[MAX_THREADS];
-int thread_count = 0;
+THREAD g_thread_table[MAX_THREADS];
+int g_thread_count = 0;
 
 THREAD *current_thread = NULL;
 THREAD *idle_thread;
@@ -272,10 +273,14 @@ void CheckPreemption(THREAD *newThread);
 THREAD* RemoveReadyThread(int priority);
 void IdleThread(THREAD *t);
 void ReadyThread(THREAD *t);
-    
+
 void CreateThread(PROCESS *process, ThreadRoutine tdR, int priority){
-    THREAD *t = &thread_table[thread_count++];
-    t->id = thread_count;
+    if(g_thread_count >= MAX_THREADS)
+       KernelBugcheck("Thread Table overflow");
+       
+    THREAD *t = &g_thread_table[g_thread_count++]; //start index from 0
+    t->id = g_thread_count; //but id will start from 1 (good)
+    t->pc = 0;
     t->priority = priority;
     t->base_priority = priority;
     t->quantum = 3;
@@ -291,45 +296,126 @@ void CreateThread(PROCESS *process, ThreadRoutine tdR, int priority){
     CheckPreemption(t);
 }
 
+/*
+  READY_QUEUE Invariant:
+  For each priority p (Thread's priority):
+   (g_ready_queues[p].count > 0)  <=>  (g_ready_bitmap & (1u << p)) != 0
+  Meaning:
+  - If the queues at priority p is non-empty, its bit must be set.
+  - If the bit is set, the queue must be non-empty
+  This invariant must always hold.
+ */
 typedef struct _READY_QUEUE{
     THREAD *threads[MAX_THREADS];
+    int head;
+    int tail;
     int count;
 } READY_QUEUE;
 
-READY_QUEUE ready_queues[MAX_PRIORITY];
-uint32_t ready_bitmap = 0;
+//Ready Queue contain threads of same priority
+//Stores the acutal threads
+READY_QUEUE g_ready_queues[MAX_PRIORITY];
+
+/*
+  This is for masking on priority base
+  Tells the scheduler which priority have threads
+*/
+uint32_t g_ready_bitmap = 0;
+
+//Invariant assert
+void ValidateReadyQueueInvariant(int p){
+    READY_QUEUE *q = &g_ready_queues[p];
+    int bit_set = (g_ready_bitmap & (1u << p)) != 0;
+    if((q->count > 0) != bit_set)
+        KernelBugcheck("Ready queue invariant violated");
+}
 
 void InitDispatcher(){
     for(int i = 0; i < MAX_PRIORITY; i++){
-        ready_queues[i].count = 0;
+        g_ready_queues[i].count = 0;
+        g_ready_queues[i].head = 0;
+        g_ready_queues[i].tail = 0;
     }
-    ready_bitmap = 0;
+    g_ready_bitmap = 0;
 }
 
+/*
+  This function only job is to take thread which state is THREAD_READY
+  Check it's priority,
+  Store that thread on ready queue according to priority as index,
+  Set the bit or map it to the global ready bitmap  (g_ready_bitmap) 
+ */ 
 void ReadyThread(THREAD *t){
     int p = t->priority;
-    READY_QUEUE *q = &ready_queues[p];
-    q->threads[q->count++] = t;
-    ready_bitmap |= (1 << p);
+    READY_QUEUE *q = &g_ready_queues[p];
+    if(q->count >= MAX_THREADS)
+        KernelBugcheck("Ready queue overflow");
+
+    q->threads[q->tail] = t;
+    q->tail = (q->tail + 1) % MAX_THREADS;
+    q->count++;
+    //set bit 
+    g_ready_bitmap |= (1u << p); //mask priority
+    ValidateReadyQueueInvariant(p);
 }
 
+/*
+  Remove thread from g_ready_queues on the given priority
+  Also update the g_ready_queues states and
+  clear bit of g_ready_bitmap present at priority number place when q->count = 0
+ */
 THREAD* RemoveReadyThread(int priority){
-    READY_QUEUE *q = &ready_queues[priority];
-    if(q->count == 0)
-        return NULL;
-
-    THREAD *t = q->threads[0];
-    for(int i = 1; i < q->count; i++)
-        q->threads[i-1] = q->threads[i];
-
+    READY_QUEUE *q = &g_ready_queues[priority];
+    if(q->count == 0) return NULL;
+    THREAD *t = q->threads[q->head];
+    q->threads[q->head] = NULL; //just to ensure safely
+    q->head = (q->head + 1) % MAX_THREADS;
     q->count--;
+    //If the count becomes we must clear that priority represent set bit 
     if(q->count == 0)
-        ready_bitmap &= ~(1 << priority);
+        g_ready_bitmap &= ~(1u << priority);
+
+     ValidateReadyQueueInvariant(priority);
 
     return t;
 }
 
-int FindHighestSetBit(int x){
+int RemoveFromReadyQueue(THREAD *t, int priority){
+    READY_QUEUE *q = &g_ready_queues[priority];
+    int removed = 0;
+    for(int i = 0; i < q->count; i++){
+        int idx = (q->head + i) % MAX_THREADS;
+        if(q->threads[idx] == t){
+            removed = 1;
+            for(int j = i; j < q->count - 1; j++){
+                int from = (q->head + j + 1) % MAX_THREADS;
+                int to = (q->head + j) % MAX_THREADS;
+                q->threads[to] = q->threads[from];
+            }
+            q->tail = (q->tail - 1 + MAX_THREADS) % MAX_THREADS;
+            q->count--;
+            break;
+        }
+    }
+    if(q->count == 0)
+        g_ready_bitmap &= ~(1u << priority);
+
+    return removed;
+}
+
+void ReinsertReadyThread(THREAD *t, int oldPriority){
+    if(t->state != THREAD_READY)
+        return;
+
+   int found =  RemoveFromReadyQueue(t, oldPriority);
+   if(!found)
+       KernelBugcheck("Thread not found during reinsert");
+   
+    ReadyThread(t);
+}
+
+//This function is checked (working perfectly)
+int FindHighestSetBit(uint32_t x){
     if(x == 0)
         return -1;
 
@@ -345,32 +431,39 @@ int FindHighestSetBit(int x){
 }
 
 int FindHighestPriority(){
-    if(ready_bitmap == 0)
+    if(g_ready_bitmap == 0)
         return -1;
-    return FindHighestSetBit(ready_bitmap);
+    return FindHighestSetBit(g_ready_bitmap);
 }
 
+/*
+ PickNextThread selects the next runnable thread based on priority.
+ Policy:
+  - Highest-priority READY thread is selected using g_ready_bitmap.
+  - TERMINATED threads are skipped.
+  - If no READY threads exist, the idle thread is returned.
+ */
 THREAD* PickNextThread(){
-    int p = FindHighestPriority();
-    
-    if(p < 0)
-        return idle_thread;
-
-    THREAD *t;
-    do{
-        t = RemoveReadyThread(p);
-    }while(t && t->state == THREAD_TERMINATED);
-
-    return t;
+    while(g_ready_bitmap != 0){
+        int p = FindHighestPriority(); 
+        THREAD *t = RemoveReadyThread(p);
+        if(t && t->state != THREAD_TERMINATED)
+            return t;
+    }
+    return idle_thread;
 }
 
 int reschedule_requested = 0;
 
+//Checked
 void Schedule(){
     if(cpu.current_irql >= DISPATCH_LEVEL)
         return;
 
+    printf("g_ready_bitmap = %x\n", g_ready_bitmap);
+    
     THREAD *next = PickNextThread();
+    
     if(!next)
         next = idle_thread;
     
@@ -418,8 +511,10 @@ void TimerDPC(){
     if(current_thread->quantum <= 0){
         printf("Thread %d quantum expired\n", current_thread->id);
         current_thread->quantum = 3;
-        current_thread->state = THREAD_READY;
-        ReadyThread(current_thread);
+        THREAD *old = current_thread;
+        old->state = THREAD_READY;
+        ReadyThread(old);
+        current_thread = NULL;
         reschedule_requested = 1;
     }
 }
@@ -499,13 +594,11 @@ THREAD* DequeueHighestPriority(WAIT_QUEUE *q){
             best_index = i;
         }
     }
-
     THREAD *best = q->threads[best_index];
     for(int i = best_index; i < q->count-1; i++)
         q->threads[i] = q->threads[i+1];
 
     q->count--;
-    
     return best;
 }
 
@@ -516,7 +609,8 @@ typedef struct _MUTEX{
     WAIT_QUEUE waiters;
 } MUTEX;
 
-HANDLE g_hMutex;
+HANDLE g_hMutex1;
+HANDLE g_hMutex2;
 
 MUTEX* CreateMutexObject(){
     MUTEX *m = malloc(sizeof(MUTEX));
@@ -525,12 +619,11 @@ MUTEX* CreateMutexObject(){
 
     m->header.type =  OBJECTTYPE_MUTEX;
     m->header.ref_count = 1;
-
     m->locked = 0;
     m->owner = NULL;
     InitWaitQueue(&m->waiters);
-
-    puts("Mutex object created");
+    static int countMutex = 0;
+    printf("Mutex object created %d\n", ++countMutex);
     return m;
 }
 
@@ -543,30 +636,31 @@ void BlockCurrentThread(WAIT_QUEUE *queue){
 
     current_thread->state = THREAD_BLOCKED;
     EnqueueWaiter(queue, current_thread);
-
     printf("Thread %d blocked\n", current_thread->id);
     reschedule_requested = 1;
 }
 
-void RemoveFromReadyQueue(THREAD *t, int priority){
-    READY_QUEUE *q = &ready_queues[priority];
+//Resolved Chained Priority Inversion
+void BoostPriorityChain(THREAD *t, int newPriority){
+    if(!t) return;
+    if(t->priority >= newPriority) return;
+    printf("Boosting T%d priority %d -> %d\n", t->id, t->priority, newPriority);
+    int oldPriority = t->priority;
+    t->priority = newPriority;
+    
+    if(t->state == THREAD_READY)
+        ReinsertReadyThread(t, oldPriority);
 
-    for(int i = 0; i < q->count; i++){
-        if(q->threads[i] == t){
-            for(int j = i + 1; j < q->count; j++)
-                q->threads[j - 1] = q->threads[j];
-
-            q->count--;
-            break;
-        }
+    /*Propagate boost if this thread is blocked */
+    if(t->waiting_mutex && t->waiting_mutex->owner){
+        BoostPriorityChain(t->waiting_mutex->owner, newPriority);
     }
-    if(q->count == 0)
-        ready_bitmap &= ~(1<<priority);
 }
 
 void AcquireMutex(MUTEX *m){
     if(cpu.current_irql != PASSIVE_LEVEL)
         KernelBugcheck("AcquireMutex must occur at PASSIVE_LEVEL");
+    
     if(!m->locked){
         m->locked = 1;
         m->owner = current_thread;
@@ -574,20 +668,12 @@ void AcquireMutex(MUTEX *m){
         return;
     }
     printf("Thread %d blocking on mutex.\n", current_thread->id);
+    current_thread->waiting_mutex = m;
+
     THREAD *owner = m->owner;
-    if(owner && owner->priority < current_thread->priority){
-        printf("Priority inheritance: Boosting T%d from %d to %d\n",
-               owner->id,
-               owner->priority,
-               current_thread->priority);
-        int oldPriority = owner->priority;
-        owner->priority = current_thread->priority;
-     
-        if(owner->state == THREAD_READY){
-            RemoveFromReadyQueue(owner, oldPriority);
-            ReadyThread(owner);
-        }
-    }
+    if(owner)
+        BoostPriorityChain(owner, current_thread->priority);
+    
     ObReferenceObject((KOBJECT*)m);
     BlockCurrentThread(&m->waiters);
 }
@@ -613,6 +699,7 @@ void ReleaseMutex(MUTEX *m){
         return;
     }
     THREAD *next = DequeueHighestPriority(&m->waiters);
+    next->waiting_mutex = NULL; 
     ObDereferenceObject((KOBJECT*)m);
     m->owner = next;
     next->owned_mutex = m;
@@ -698,16 +785,16 @@ void SignalEvent(EVENT *e){
 }
 
 void DetectPriorityInversion(MUTEX *m){
-    for(int i = 0; i < thread_count; i++){
-        THREAD *blocked = &thread_table[i];
+    for(int i = 0; i < g_thread_count; i++){
+        THREAD *blocked = &g_thread_table[i];
         if(blocked->state != THREAD_BLOCKED)
             continue;
         
         if(m->owner){
             THREAD *owner = m->owner;
             if(blocked->priority > owner->priority){
-                for(int j = 0; j < thread_count; j++){
-                    THREAD *other = &thread_table[j];
+                for(int j = 0; j < g_thread_count; j++){
+                    THREAD *other = &g_thread_table[j];
                     if((other->state == THREAD_READY ||
                         other->state == THREAD_RUNNING) &&
                        other->priority > owner->priority &&
@@ -745,6 +832,7 @@ void IdleThread(THREAD *t){
     puts("Idle running...");
 }
 
+//These are test threads
 void Thread_A(THREAD *t){
     puts("Thread A executing...");
     switch(t->pc){
@@ -792,57 +880,28 @@ void Thread_B(THREAD *t){
 }
 
 void Thread_L(THREAD *t){
-    KOBJECT *obj =  ObReferenceObjectByHandle(t->owner, g_hMutex);
-    if(!obj)
-        KernelBugcheck("Invalid handle");
+    KOBJECT *obj = ObReferenceObjectByHandle(t->owner, g_hMutex1);
+    if(!obj) KernelBugcheck("Invalid handle");
 
-    MUTEX *m = (MUTEX*)obj;
+    MUTEX *m1 = (MUTEX*)obj;
     
     switch(t->pc){
         case 0:{
-            puts("L : Acquiring mutex");
-            AcquireMutex(m);
+            puts("L: acquiring M1");
+            AcquireMutex(m1);
             t->pc = 1;
             ObDereferenceObject(obj);
             return;
         }
         case 1:{
-            puts("L: Holding mutex (long work)");
+            puts("L: holding M1 (long work)");
             t->pc = 2;
-            ObDereferenceObject(obj);
             return;
         }
         case 2:{
-            puts("L: Releasing mutex");
-            ReleaseMutex(m);
+            puts("L: releasing M1");
+            ReleaseMutex(m1);
             TerminateThread(t);
-            reschedule_requested = 1;
-            ObDereferenceObject(obj);
-            return;
-        }
-    }
-}
-
-void Thread_H(THREAD *t){
-    KOBJECT *obj = ObReferenceObjectByHandle(t->owner, g_hMutex);
-    if(!obj) KernelBugcheck("Invalid handle");
-
-    MUTEX *m = (MUTEX*)obj;
-    
-    switch(t->pc){
-        case 0:{
-            puts("H: Trying to acquire mutex");
-            AcquireMutex(m);
-            t->pc = 1;
-            ObDereferenceObject(obj);
-            return;
-        }
-        case 1:{
-            puts("H: Acquired mutex");
-            puts("H: DONE it's work");
-            ReleaseMutex(m);
-            TerminateThread(t);
-            t->pc = 2;
             reschedule_requested = 1;
             ObDereferenceObject(obj);
             return;
@@ -851,17 +910,61 @@ void Thread_H(THREAD *t){
 }
 
 void Thread_M(THREAD *t){
+    KOBJECT *obj1 = ObReferenceObjectByHandle(t->owner, g_hMutex1);
+    KOBJECT *obj2 = ObReferenceObjectByHandle(t->owner, g_hMutex2);
+
+    if(!obj1 || !obj2)
+        KernelBugcheck("Invalid handle");
+
+    MUTEX *m1 = (MUTEX*)obj1;
+    MUTEX *m2 = (MUTEX*)obj2;
+
     switch(t->pc){
         case 0:{
-            puts("M: running independent work.");
+            puts("M: acquiring M2");
+            AcquireMutex(m2);
             t->pc = 1;
+            break;
+        }
+        case 1:{
+            puts("M: trying to acquire M1");
+            AcquireMutex(m1);   // blocks here
+            t->pc = 2;
+            break;
+        }
+        case 2:{
+            puts("M: releasing M2");
+            ReleaseMutex(m2);
+            TerminateThread(t);
+            reschedule_requested = 1;
+            break;
+        }
+    }
+    ObDereferenceObject(obj1);
+    ObDereferenceObject(obj2);
+}
+
+void Thread_H(THREAD *t){
+    KOBJECT *obj = ObReferenceObjectByHandle(t->owner, g_hMutex2);
+    if(!obj) KernelBugcheck("Invalid handle");
+
+    MUTEX *m2 = (MUTEX*)obj;
+    switch(t->pc){
+        case 0:{
+            puts("H: trying to acquire M2");
+            AcquireMutex(m2);
+            t->pc = 1;
+            ObDereferenceObject(obj);
             return;
         }
         case 1:{
-            puts("M: running independent work.");
+            puts("H: acquired M2");
+            ReleaseMutex(m2);
             TerminateThread(t);
+            reschedule_requested = 1;
+            ObDereferenceObject(obj);
             return;
-        }       
+        }
     }
 }
 
@@ -883,17 +986,21 @@ int main(){
     PROCESS *user = CreateProcess();
     PROCESS *sys = CreateProcess();
 
-    MUTEX *m = CreateMutexObject();
-    g_hMutex = ObInsertHandle(user, (KOBJECT*)m);
+    MUTEX *m1 = CreateMutexObject();
+    MUTEX *m2 = CreateMutexObject();
+    g_hMutex1 = ObInsertHandle(user, (KOBJECT*)m1);
+    g_hMutex2 = ObInsertHandle(user, (KOBJECT*)m2);
     
     puts("\n");
     CreateThread(sys, IdleThread, 1);
-    idle_thread = &thread_table[thread_count - 1];
+    idle_thread = &g_thread_table[g_thread_count - 1];
     CreateThread(user, Thread_L, 1);
     Schedule();
     current_thread->tRoutine(current_thread);
     
     CreateThread(user, Thread_M, 3);
+    Schedule();
+    current_thread->tRoutine(current_thread);
     CreateThread(user, Thread_H, 5);
     InitEvent(&io_event);
     
@@ -902,16 +1009,17 @@ int main(){
         .isr = TimerIsr
     };
 
-    for(int i = 0; i < 10; i++){
+    for(int i = 0; i < 11; i++){
         printf("\n--- Timer Tick %d ---\n", i);
         TriggerInterrupt(&timer_interrupt);
         
         if(cpu.current_irql < DISPATCH_LEVEL){
-            if(reschedule_requested || !current_thread || current_thread->state != THREAD_RUNNING){
+            if(reschedule_requested){
                 Schedule();
-                reschedule_requested = 0;
-                DetectPriorityInversion(m);
+                reschedule_requested = 0;              
             }
+            DetectPriorityInversion(m1);
+            DetectPriorityInversion(m2);
         }
                    
         if(current_thread && current_thread->state == THREAD_RUNNING){
