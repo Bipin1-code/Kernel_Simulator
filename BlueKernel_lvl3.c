@@ -202,6 +202,8 @@ typedef struct _KOBJECT{
 
 typedef int HANDLE;
 
+//[NOTE: Do not touch above code they are correctly working] 
+
 typedef struct _THREAD THREAD;
 typedef struct _PROCESS PROCESS;
 typedef struct _MUTEX MUTEX;
@@ -360,10 +362,11 @@ void ReadyThread(THREAD *t){
 }
 
 /*
-  Remove thread from g_ready_queues on the given priority
-  Also update the g_ready_queues states and
-  clear bit of g_ready_bitmap present at priority number place when q->count = 0
- */
+  Remove a thread from g_ready_queues at the given priority.
+  The provided priority is expected to be the highest set in g_ready_bitmap.
+  Updates queue state accordingly and clears the corresponding bit in
+  g_ready_bitmap if the queue becomes empty.
+*/
 THREAD* RemoveReadyThread(int priority){
     READY_QUEUE *q = &g_ready_queues[priority];
     if(q->count == 0) return NULL;
@@ -380,6 +383,12 @@ THREAD* RemoveReadyThread(int priority){
     return t;
 }
 
+/*
+  Removes a specific thread from g_ready_queues at an arbitrary priority.
+  Unlike RemoveReadyThread (which dequeues from the highest priority),
+  this function searches for and removes a given thread regardless of
+  its position in the queue.
+*/
 int RemoveFromReadyQueue(THREAD *t, int priority){
     READY_QUEUE *q = &g_ready_queues[priority];
     int removed = 0;
@@ -387,6 +396,7 @@ int RemoveFromReadyQueue(THREAD *t, int priority){
         int idx = (q->head + i) % MAX_THREADS;
         if(q->threads[idx] == t){
             removed = 1;
+            //shifting
             for(int j = i; j < q->count - 1; j++){
                 int from = (q->head + j + 1) % MAX_THREADS;
                 int to = (q->head + j) % MAX_THREADS;
@@ -403,12 +413,17 @@ int RemoveFromReadyQueue(THREAD *t, int priority){
     return removed;
 }
 
+/*
+  Helper function of BoostPriorityChain
+  This function just remove thread from ready_queue,
+  Insert again with new priority.
+ */
 void ReinsertReadyThread(THREAD *t, int oldPriority){
     if(t->state != THREAD_READY)
         return;
 
-   int found =  RemoveFromReadyQueue(t, oldPriority);
-   if(!found)
+    int found = RemoveFromReadyQueue(t, oldPriority);
+    if(!found)
        KernelBugcheck("Thread not found during reinsert");
    
     ReadyThread(t);
@@ -481,6 +496,17 @@ void Schedule(){
     printf("Switched to thread %d\n", current_thread->id);
 }
 
+/*
+  CheckPreemption is a scheduler helper invoked when a thread becomes READY.
+  It determines whether the current thread should be preempted by a higher-priority thread.
+  Rules:
+  - Preemption is required if newThread has higher priority than current_thread.
+  - However, preemption decision is only actionable when IRQL < DISPATCH_LEVEL.
+  - If IRQL >= DISPATCH_LEVEL, preemption is deferred.
+  Behavior:
+  - Sets reschedule_requested to indicate a pending context switch.
+  - Actual context switch is performed later by the scheduler at DISPATCH_LEVEL.
+*/
 void CheckPreemption(THREAD *newThread){
     if(!current_thread)
         return;
@@ -490,7 +516,7 @@ void CheckPreemption(THREAD *newThread){
             printf("Immediate preemption: T%d -> T%d\n",
                    current_thread->id, newThread->id);
         }else{
-            printf("Preemption defferred (IRQL %d)\n",
+            printf("Preemption deferred (IRQL %d)\n",
                    cpu.current_irql);  
         }
         reschedule_requested = 1;
@@ -594,11 +620,13 @@ THREAD* DequeueHighestPriority(WAIT_QUEUE *q){
             best_index = i;
         }
     }
+
     THREAD *best = q->threads[best_index];
     for(int i = best_index; i < q->count-1; i++)
         q->threads[i] = q->threads[i+1];
 
     q->count--;
+    
     return best;
 }
 
@@ -617,8 +645,9 @@ MUTEX* CreateMutexObject(){
     if(!m)
         KernelBugcheck("Out of memory");
 
-    m->header.type =  OBJECTTYPE_MUTEX;
+    m->header.type = OBJECTTYPE_MUTEX;
     m->header.ref_count = 1;
+  
     m->locked = 0;
     m->owner = NULL;
     InitWaitQueue(&m->waiters);
@@ -627,6 +656,16 @@ MUTEX* CreateMutexObject(){
     return m;
 }
 
+/*
+  Blocks the currently running thread and enqueues it on the given wait queue.
+  Expected to be called from synchronization primitives (e.g., AcquireMutex,
+  WaitEvent) when the thread cannot proceed.
+  Responsibilities:
+  - Enforce invariant: blocking is only allowed at PASSIVE_LEVEL.
+  - Transition current_thread state to THREAD_BLOCKED.
+  - Insert the thread into the specified WAIT_QUEUE.
+  - Request rescheduling so another runnable thread can be dispatched.
+*/
 void BlockCurrentThread(WAIT_QUEUE *queue){
     if(cpu.current_irql != PASSIVE_LEVEL)
         KernelBugcheck("Blocking above PASSIVE_LEVEL");
@@ -636,18 +675,27 @@ void BlockCurrentThread(WAIT_QUEUE *queue){
 
     current_thread->state = THREAD_BLOCKED;
     EnqueueWaiter(queue, current_thread);
+
     printf("Thread %d blocked\n", current_thread->id);
     reschedule_requested = 1;
 }
 
-//Resolved Chained Priority Inversion
+/*
+  Applies priority inheritance with transitive (chain) propagation.
+  - Elevates thread priority to at least newPriority.
+  - Maintains ready queue ordering if the thread is schedulable.
+  - Recursively propagates the boost through mutex ownership
+    to prevent priority inversion across dependency chains.
+*/
 void BoostPriorityChain(THREAD *t, int newPriority){
     if(!t) return;
     if(t->priority >= newPriority) return;
+
     printf("Boosting T%d priority %d -> %d\n", t->id, t->priority, newPriority);
+
     int oldPriority = t->priority;
     t->priority = newPriority;
-    
+
     if(t->state == THREAD_READY)
         ReinsertReadyThread(t, oldPriority);
 
@@ -657,6 +705,22 @@ void BoostPriorityChain(THREAD *t, int newPriority){
     }
 }
 
+/*
+  AcquireMutex:
+  A mutex provides exclusive ownership of a resource, ensuring that only
+  one thread executes a critical section at a time.
+  Precondition:
+  - Must be called at PASSIVE_LEVEL (may block)
+  Behavior:
+  - If mutex is free:
+      - Acquire ownership immediately
+  - If mutex is owned:
+      - Current thread is blocked and added to waiters list
+      - Owner may receive priority boost (priority inheritance)
+  Notes:
+  - Blocking is performed via BlockCurrentThread()
+  - Priority inheritance is handled via BoostPriorityChain()
+*/
 void AcquireMutex(MUTEX *m){
     if(cpu.current_irql != PASSIVE_LEVEL)
         KernelBugcheck("AcquireMutex must occur at PASSIVE_LEVEL");
@@ -678,6 +742,29 @@ void AcquireMutex(MUTEX *m){
     BlockCurrentThread(&m->waiters);
 }
 
+/*
+  ReleaseMutex:
+  Releases ownership of a mutex held by the current thread.
+  Precondition:
+  - Must be called by the owning thread.
+  Behavior:
+  - Restores the current thread's priority to its base priority
+    (current implementation assumes a single owned mutex).
+  - If no threads are waiting:
+      - Mutex is marked free.
+  - If waiters exist:
+      - Highest-priority waiting thread is selected.
+      - Ownership is transferred directly to that thread.
+      - The selected thread is moved to READY state.
+  Scheduling:
+  - A reschedule may be triggered if the awakened thread has
+    higher priority (via CheckPreemption).
+  Notes:
+  - This implementation does not yet handle multiple owned mutexes.
+  - Priority restoration is simplified and will be updated when
+    full priority inheritance tracking is implemented.
+*/
+// TODO: Replace simple priority restore with RecalculatePriority()
 void ReleaseMutex(MUTEX *m){
     if(!current_thread)
         KernelBugcheck("No current thread");
@@ -731,20 +818,6 @@ void TerminateThread(THREAD *t){
         reschedule_requested = 1;
 }
 
-void WakeOne(WAIT_QUEUE *queue){
-    if(cpu.current_irql != DISPATCH_LEVEL)
-        KernelBugcheck("Wake must occur at DISPATCH_LEVEL");
-
-    if(queue->count == 0)
-        return;
-    
-    THREAD *t = DequeueHighestPriority(queue);
-    t->state = THREAD_READY;
-    ReadyThread(t);
-    printf("Thread %d awakened\n", t->id);
-    CheckPreemption(t);
-}
-
 typedef struct{
     KOBJECT header;
     int signaled;
@@ -770,6 +843,20 @@ void WaitEvent(EVENT *e){
         return;
     }
     BlockCurrentThread(&e->waiters);
+}
+
+void WakeOne(WAIT_QUEUE *queue){
+    if(cpu.current_irql != DISPATCH_LEVEL)
+        KernelBugcheck("Wake must occur at DISPATCH_LEVEL");
+
+    if(queue->count == 0)
+        return;
+    
+    THREAD *t = DequeueHighestPriority(queue);
+    t->state = THREAD_READY;
+    ReadyThread(t);
+    printf("Thread %d awakened\n", t->id);
+    CheckPreemption(t);
 }
 
 void SignalEvent(EVENT *e){
