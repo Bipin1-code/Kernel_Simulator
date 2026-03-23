@@ -1,0 +1,22 @@
+
+# OS interrupt
+
+CC = gcc
+CFLAGS = -Wall -Werror -Wextra -pedantic
+SOURCE = IRQ_KernelDeal.c
+TARGET = Interrupt
+OBJECT = $(SOURCE:.c=.o)
+
+all: $(TARGET)
+
+$(TARGET): $(OBJECT)
+	$(CC) $(OBJECT) -o $@
+	@echo "Built $@ from $^"
+
+%.o: %.c
+	$(CC) $(CFLAGS) -c $< -o $@
+	@echo "Compiled $< into $@"
+
+clean:
+	rm -f $(OBJECT) $(TARGET)
+	@echo "Removed $? $(TARGET)"
