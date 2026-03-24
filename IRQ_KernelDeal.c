@@ -2,11 +2,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-
-typedef struct _CPU CPU;
-typedef struct _LAPIC LAPIC;
-typedef struct _IOAPIC IOAPIC;
-typedef struct _DEVICE DEVICE;
+#include <stdint.h>
 
 #define MAX_CPU 4
 #define MAX_DEVICES 8
@@ -14,7 +10,16 @@ typedef struct _DEVICE DEVICE;
 #define MMIO_SIZE 1024
 #define MAX_VECTOR 256
 #define LAPIC_BASE 0xFEE00000
+#define MAX_VECTOR_PRIORITY 64
+#define DEBURIJN64 0x03F79D71B4CB0A89
+#define HANDLED 1
+#define NOT_HANDLED 0
 
+typedef struct _CPU CPU;
+typedef struct _LAPIC LAPIC;
+typedef struct _IOAPIC IOAPIC;
+typedef struct _DEVICE DEVICE;
+    
 typedef struct _SYSTEM{
     CPU *cpus[MAX_CPU];
     int c_count;
@@ -31,9 +36,31 @@ typedef struct _CPU{
     int running;
 } CPU;
 
+//these are vector priority bitmap for to handle pending vector by lapic when more interrupt came at once
+static uint64_t g_vector_priority_Table[MAX_VECTOR_PRIORITY];
+
+void BuildDeBurijnTable(){
+    for(int v = 0; v < MAX_VECTOR_PRIORITY; v++){
+        uint64_t mV = (1ULL << v);
+        uint64_t idx = (mV * DEBURIJN64) >> 58;
+        g_vector_priority_Table[idx] = v;
+    }
+}
+
+uint64_t FindLowestSetBit(uint64_t bitmap){
+    //just for ensurement
+    if(g_vector_priority_Table[0] != 0 || g_vector_priority_Table[1] != 1) {
+        BuildDeBurijnTable();  // Initialize if not done
+    }
+    if(bitmap == 0) return -1;
+    uint64_t lowest = bitmap & -bitmap;
+    uint64_t idx = (lowest * DEBURIJN64) >> 58;
+    return g_vector_priority_Table[idx];
+}
+//It present in cpu core; means each cpu core have LAPIC
 typedef struct _LAPIC{
     int id;
-    int pending_vector;
+    uint64_t pending_vectors;
     int in_service_vector;
     CPU *owner_cpu;
 } LAPIC;
@@ -71,6 +98,7 @@ typedef struct _DEVICE{
     int use_msi;
 } DEVICE;
 
+//NOT in use yet
 //MMIO = Memory Mapped Input/Output 
 unsigned char g_MMIO[MMIO_SIZE];
 
@@ -78,7 +106,7 @@ void DMA_Write(void *dst, void *src, size_t size){
     memcpy(dst, src, size);
 }
 
-typedef void (*fHandler)(void*);
+typedef int (*fHandler)(void*);
 
 typedef struct{
     fHandler handler;
@@ -98,7 +126,7 @@ LAPIC* CreateLAPIC(int id, CPU *owner){
     lapic->id = id;
     lapic->owner_cpu = owner;
     lapic->in_service_vector = -1;
-    lapic->pending_vector = -1;
+    lapic->pending_vectors = 0;
     return lapic;
 }
 
@@ -125,7 +153,7 @@ DEVICE* CreateDevice(const char *name, const MSI_CAP *msi_cap){
     dev->name[sizeof(dev->name) - 1] = '\0';
     dev->msi_cap = msi_cap;
     return dev;
-}
+} 
 
 //We support one vector  for now
 static const MSI_CAP msi_cap_1vec = {.supported = 1, .multi_msg = 1};
@@ -173,10 +201,6 @@ void DevicePool(){
     g_sys.devices[g_sys.d_count++] = microphone;
 }
 
-/*
-  First Signal flow
-  Device -> IOAPIC -> LAPIC (pending only)
- */
 void IoApicHandleIRQ(IOAPIC *ioapic, int irq){
     if(irq < 0 || irq >= MAX_IRQ){
         printf("[IOAPIC] Invalid IRQ %d\n", irq);
@@ -190,12 +214,18 @@ void IoApicHandleIRQ(IOAPIC *ioapic, int irq){
            irq, vector, cpu_id);
     CPU *cpu = g_sys.cpus[cpu_id];
     if(!cpu || !cpu->lapic) return;
-    cpu->lapic->pending_vector = vector;
+    cpu->lapic->pending_vectors |= (1ULL << vector) ;
 }
 
 void DeviceRaiseInterrupt(DEVICE *device){
     if(!device) return;
     if(device->use_msi){
+        int vector = device->msi.data;
+        if(vector >= 64){
+            printf("[Device: %s] Vector %d too large for bitmap\n",
+                   device->name, vector);
+            return;
+        }
         //MSI direct vector
         printf("[Device: %s] MSI interrupt vector %d\n",
                device->name, device->msi.data);
@@ -203,7 +233,8 @@ void DeviceRaiseInterrupt(DEVICE *device){
         //for cpu id
         int cpu_id = (device->msi.address - LAPIC_BASE) >> 12;
         LAPIC *lapic = g_sys.cpus[cpu_id]->lapic;
-        lapic->pending_vector = device->msi.data;
+        //device->msi.data is vector
+        lapic->pending_vectors |= (1ULL << vector);
     }else{
         printf("[Device: %s] IRQ line %d\n",
                device->name, device->irq.irq_line);
@@ -211,7 +242,76 @@ void DeviceRaiseInterrupt(DEVICE *device){
     }
 }
 
+typedef int (*fIsrHandlerTable)(void*);
+
+typedef struct _ISR_NODE{
+    fIsrHandlerTable fhandler;
+    struct _ISR_NODE *next;
+} ISR_NODE;
+
+ISR_NODE *g_isr_table[MAX_VECTOR];
+
+void RegisterIsr(int vector, fIsrHandlerTable handler){
+    ISR_NODE *node = malloc(sizeof(ISR_NODE));
+    node->fhandler = handler;
+    node->next = g_isr_table[vector];
+    g_isr_table[vector] = node;
+}
+    
+int LapicGetNextVector(LAPIC *lapic){
+    if(lapic->pending_vectors == 0) return -1;
+    int vector = FindLowestSetBit(lapic->pending_vectors);
+    lapic->pending_vectors &= ~(1ULL << vector);
+    lapic->in_service_vector = vector;
+    return vector; 
+}
+
+void RegisterInterrupt(int vector, fHandler handler){
+    g_idt[vector].handler = handler;
+}
+
+void DispatchInterrupt(CPU *cpu, int vector){
+    if(vector < 32){
+        printf("[CPU %d] Exception vector %d\n",
+               cpu->id, vector);
+        cpu->lapic->in_service_vector = -1;
+        return;
+    }
+    ISR_NODE *node = g_isr_table[vector];
+    if(!node){
+        printf("[CPU %d] Unhandled interrupt vector %d\n",
+               cpu->id, vector);
+        return;
+    }
+    printf("[CPU %d] Dispatch vector %d\n",
+           cpu->id, vector);
+    while(node){
+        if(node->fhandler(NULL) == HANDLED) break;
+        node = node->next;
+    }
+    cpu->lapic->in_service_vector = -1;
+}
+
+void CpuStep(CPU *cpu){
+    int vector = LapicGetNextVector(cpu->lapic);
+    if(vector != -1){
+        DispatchInterrupt(cpu, vector);
+    }
+}
+
+int KeyboardHandler(void *ctx){
+    (void)ctx;
+    printf("[ISR] Keyboard interrupt handled\n");
+    return HANDLED;
+}
+
 //test functions:
+int FakeHandler(void *ctx){
+    (void)ctx;
+    printf("[ISR] Not mine\n");
+    return NOT_HANDLED;
+}
+
 int IsLapic_id_n_owner(LAPIC *lapic){
     if (!lapic) {
         printf("LAPIC is NULL\n");
@@ -247,19 +347,22 @@ void DisplayDeviceConfig(DEVICE *device){
 }
 
 void DumpLAPIC(LAPIC *lapic){
-    printf("[LAPIC: %d] pending = %d, in-service = %d\n",
+    printf("[LAPIC: %d] pending mask = %llu, in-service = %d\n",
            lapic->id,
-           lapic->pending_vector,
+           lapic->pending_vectors,
            lapic->in_service_vector);
 }
 
 void SystemInit(){
+    BuildDeBurijnTable();
     g_sys.c_count = 0;
     g_sys.d_count = 0;
+
     while(g_sys.c_count < MAX_CPU){
         int passVal = g_sys.c_count;
         g_sys.cpus[g_sys.c_count++] = RecognisedCPU(passVal);
     }
+
     g_sys.ioapic = calloc(1, sizeof(IOAPIC));
     if(!g_sys.ioapic){
         puts("Memory allocation failed for IOAPIC instance");
@@ -272,12 +375,22 @@ void SystemInit(){
         DisplayDeviceConfig(g_sys.devices[i]);
     }
     puts("System Booting>>>");
+
     printf("System has %d cpu core\nConnected %d devices\n",
            g_sys.c_count, g_sys.d_count);
 
+    puts("System Running>>>");
+    
+    RegisterInterrupt(33, KeyboardHandler);
+    RegisterIsr(33, KeyboardHandler);
+    RegisterIsr(33, FakeHandler);
+    
+    
     DeviceRaiseInterrupt(g_sys.devices[0]);
     DumpLAPIC(g_sys.cpus[0]->lapic);
-    puts("System Running>>>");
+    CpuStep(g_sys.cpus[0]);
+
+    puts("System Terminated>>>");
 }
 
 int main(){
