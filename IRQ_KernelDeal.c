@@ -72,7 +72,7 @@ void BuildDeBurijnTable(){
     }
 }
 
-uint64_t FindLowestSetBit(uint64_t bitmap){
+int FindLowestSetBit(uint64_t bitmap){
     //just for ensurement
     if(g_vector_priority_Table[0] != 0 || g_vector_priority_Table[1] != 1) {
         BuildDeBurijnTable();  // Initialize if not done
@@ -139,7 +139,7 @@ int RB_IsFull(RING_BUFFER *rb){
 
 void RB_Push(RING_BUFFER *rb, int val){
     if(RB_IsFull(rb)){
-        printf("[RB] Overflow!\n");
+        LOG_KERN("[RB] Overflow, value %d lost\n", val);
         return;
     }
     rb->data[rb->tail] = val;
@@ -173,10 +173,17 @@ IDT_ENTRY g_idt[MAX_VECTOR];
 //We are manually writting ids but it's not a good practice
 //It learn phase so we can do that for now 
 LAPIC* CreateLAPIC(int id, CPU *owner){
+    if(!owner){
+        LOG_FATAL("Cannot create LAPIC with NULL owner\n");
+        return NULL;
+    }
+    if(id < 0 || id >= MAX_CPU){
+        LOG_FATAL("Invalid LAPIC id %d\n", id);
+        return NULL;
+    }
     LAPIC *lapic = malloc(sizeof(LAPIC));
     if(!lapic){
-        LOG_HW("{CPU_CORE_%d }: Memory allocation failed for LAPIC variable",
-               owner->id);
+        LOG_FATAL("Memory allocation failed for LAPIC variable");
         return NULL;
     }
     lapic->id = id;
@@ -187,23 +194,44 @@ LAPIC* CreateLAPIC(int id, CPU *owner){
 }
 
 CPU* CreateCPUCore(int cpu_id){
+    if(cpu_id < 0 || cpu_id >= MAX_CPU){
+        LOG_FATAL("Invalid CPU id %d\n", cpu_id);
+        return NULL;
+    }
     CPU *cpu= malloc(sizeof(CPU));
     if(!cpu){
-        LOG_HW("{CPU_CORE_%d}: Memory allocation failed for CPU instance",
+        LOG_FATAL("Memory allocation failed for CPU %d\n",
                cpu_id);
         return NULL;
     }
     cpu->id = cpu_id;
     cpu->lapic = CreateLAPIC(cpu_id, cpu);
+    if(!cpu->lapic){
+        free(cpu);
+        LOG_FATAL("Failed to create LAPIC for CPU %d\n", cpu_id);
+        return NULL;
+    }
     cpu->running = 0;
     return cpu;
 }
 
 CPU_CONTEXT* CreateCpuContext(int id){
-    CPU *cpu = CreateCPUCore(id); //this is not happen it real world with cpu how this functions executes;
-    if(!cpu) return NULL;
+    if(id < 0 || id >= MAX_CPU){
+        LOG_FATAL("Invalid CPU id %d in CreateCpuContext\n", id);
+        return NULL;
+    }
+    CPU *cpu = CreateCPUCore(id);
+    if(!cpu){
+        LOG_FATAL("Failed to create CPU core %d\n", id);
+        return NULL;
+    }
     CPU_CONTEXT *ctx = calloc(1, sizeof(CPU_CONTEXT));
-    if(!ctx) return NULL;
+    if(!ctx){
+        free(cpu->lapic);
+        free(cpu);
+        LOG_FATAL("CPU_CONTEXT allocation failed for CPU %d\n", id);
+        return NULL;
+    }
     ctx->cpu = cpu;
     ctx->irql = PASSIVE_LVL;
     ctx->dpc_head = NULL;
@@ -212,12 +240,23 @@ CPU_CONTEXT* CreateCpuContext(int id){
 }
 
 DEVICE* CreateDevice(const char *name, const MSI_CAP *msi_cap){
-    DEVICE *dev = calloc(1, sizeof(DEVICE));
-    if(!dev) return NULL;
-    strncpy(dev->name, name, sizeof(dev->name) - 1);
-    dev->name[sizeof(dev->name) - 1] = '\0';
-    dev->msi_cap = msi_cap;
-    return dev;
+    if(!name || !msi_cap){
+        LOG_FATAL("Invalid parameters to CreateDevice\n");
+        return NULL;
+    }
+    DEVICE *device = calloc(1, sizeof(DEVICE));
+    if(!device){
+        LOG_FATAL("Failed to create DEVICE %s\n", name);
+        return NULL;
+    }
+    strncpy(device->name, name, sizeof(device->name) - 1);
+    device->name[sizeof(device->name) - 1] = '\0';
+    device->msi_cap = msi_cap;
+    device->msi.enabled = 0;
+    device->use_msi = 0;
+    device->irq.irq_line = -1;
+    device->buffer.head = device->buffer.tail = 0;
+    return device;
 } 
 
 //We support one vector  for now
@@ -231,9 +270,15 @@ void SetupIoApicRoute(int irq, int vector, int cpu_id){
     g_sys.ioapic->routes[irq].target_cpu = cpu_id;
 }
 
-//Needed to fix later when multi CPU core campability introduce
 void ConfigureDevice(DEVICE *device, CPU *cpu, int vector){
-    if(!device) return;
+    if(!device || !cpu){
+        LOG_FATAL("Invalid device or CPU in ConfigureDevice\n");
+        return;
+    }
+    if(cpu->id < 0 || cpu->id >= MAX_CPU){
+        LOG_FATAL("CPU id %d out of range\n", cpu->id);
+        return;
+    }
     if(device->msi_cap->supported == 1){
         device->msi.address = LAPIC_BASE + (cpu->id << 12);
         device->msi.data = vector;
@@ -253,7 +298,6 @@ void ConfigureDevice(DEVICE *device, CPU *cpu, int vector){
     }
 }
 
-//To Do: Need some check validation for CPUs
 void DevicePool(){
     DEVICE *keyboard = CreateDevice("keyboard", &msi_cap_1vec);
     ConfigureDevice(keyboard, g_sys.cpus[0], 33);
@@ -310,15 +354,23 @@ void DeviceRaiseInterrupt(DEVICE *device){
 }
 
 void DeviceGenerateEvent(DEVICE *device, int value){
-    if(!device) return;
+    if(!device){
+        LOG_FATAL("NULL device cannot generate event.\n");
+        return;
+    }
     RB_Push(&device->buffer, value);
     DeviceRaiseInterrupt(device);
 }
 
-typedef int (*fIsrHandlerTable)(void*);
+typedef struct{
+    DEVICE *device;
+} ISR_CONTEXT;
+
+typedef int (*fIsrHandlerTable)(CPU_CONTEXT *cpu_ctx, ISR_CONTEXT *isr_ctx);
 
 typedef struct _ISR_NODE{
     fIsrHandlerTable fhandler;
+    void *ctx;
     struct _ISR_NODE *next;
 } ISR_NODE;
 
@@ -362,19 +414,70 @@ void ProcessDpcQueue(CPU_CONTEXT *cpu_ctx){
     LowerIrql(cpu_ctx, oldIrql);
 }
 
-void RegisterIsr(int vector, fIsrHandlerTable handler){
+void RegisterIsr(int vector, fIsrHandlerTable handler, DEVICE *device){
+    if(vector < 0 || vector >= MAX_VECTOR){
+        LOG_FATAL("Invalid vector %d in RegisterIsr\n", vector);
+        return;
+    }
+    if(!handler){
+        LOG_FATAL("Handler is NULL for vector %d\n", vector);
+        return;
+    }
     ISR_NODE *node = malloc(sizeof(ISR_NODE));
+    ISR_CONTEXT *isr_ctx = malloc(sizeof(ISR_CONTEXT));
+    if(!node || !isr_ctx){
+        LOG_FATAL("Memory allocation failed at Register ISR function");
+        free(node);
+        free(isr_ctx);
+        return;
+    }
+    isr_ctx->device = device;  
     node->fhandler = handler;
+    node->ctx = isr_ctx;
     node->next = g_isr_table[vector];
     g_isr_table[vector] = node;
 }
     
 int LapicGetNextVector(LAPIC *lapic){
+    if(!lapic){
+        LOG_FATAL("LapicGetNextVector called with NULL LAPIC\n");
+        return -1;
+    }
     if(lapic->pending_vectors == 0) return -1;
     int vector = FindLowestSetBit(lapic->pending_vectors);
+    if(vector < 0 || vector >= 64){
+        LOG_FATAL("Invalid vector %d in LAPIC\n", vector);
+        return -1;
+    }
     lapic->pending_vectors &= ~(1ULL << vector);
     lapic->in_service_vector = vector;
     return vector; 
+}
+
+void LapicSendEoi(LAPIC *lapic){
+    lapic->in_service_vector = -1;
+}
+
+int CommonInterruptEntry(void *ctx){
+    CPU_CONTEXT *cpu_ctx = (CPU_CONTEXT *)ctx;
+    CPU *cpu = cpu_ctx->cpu;
+    int vector = cpu->lapic->in_service_vector;
+
+    ISR_NODE *node = g_isr_table[vector];
+    if(!node){
+        printf("[CPU %d] Unhandled interrupt vector %d\n",
+               cpu->id, vector);
+        return 0;
+    }
+    printf("[CPU %d] Dispatching vector %d\n",
+               cpu->id, vector);
+
+    while(node){
+        ISR_CONTEXT *isr_ctx = (ISR_CONTEXT *)node->ctx;
+        if(node->fhandler(cpu_ctx, isr_ctx) == HANDLED) break;
+        node = node->next;
+    }
+    return 1;
 }
 
 void RegisterInterrupt(int vector, fHandler handler){
@@ -384,34 +487,25 @@ void RegisterInterrupt(int vector, fHandler handler){
 void DispatchInterrupt(CPU_CONTEXT *cpu_ctx, int vector){
     IRQL oldIrql = RaiseIrql(cpu_ctx, DEVICE_LVL);
     CPU *cpu = cpu_ctx->cpu;
-    if(vector < 32){
-        printf("[CPU_CTX %d] Exception vector %d\n",
+    cpu->lapic->in_service_vector = vector;
+    if(g_idt[vector].handler){
+        g_idt[vector].handler(cpu_ctx);
+    }else{
+        printf("[CPU %d] No IDT entry for vector %d\n",
                cpu->id, vector);
-        cpu->lapic->in_service_vector = -1;
-        LowerIrql(cpu_ctx, oldIrql);
-        return;
     }
-    ISR_NODE *node = g_isr_table[vector];
-    if(!node){
-        printf("[CPU_CTX %d] Unhandled interrupt vector %d\n",
-               cpu->id, vector);
-        LowerIrql(cpu_ctx, oldIrql);
-        return;
-    }
-    printf("[CPU_CTX %d] Dispatch vector %d\n",
-           cpu->id, vector);
-    while(node){
-        if(node->fhandler(cpu_ctx) == HANDLED) break;
-        node = node->next;
-    }
-    cpu->lapic->in_service_vector = -1;
+    LapicSendEoi(cpu->lapic);
     LowerIrql(cpu_ctx, oldIrql);
 }
 
 void CpuStep(CPU_CONTEXT *cpu_ctx){
+     if(!cpu_ctx || !cpu_ctx->cpu || !cpu_ctx->cpu->lapic){
+        LOG_FATAL("Invalid CPU context in CpuStep\n");
+        return;
+    }
     CPU *cpu = cpu_ctx->cpu;
-    int vector = LapicGetNextVector(cpu->lapic);
-    if(vector != -1){
+    int vector;
+    while((vector = LapicGetNextVector(cpu->lapic)) != -1){
         DispatchInterrupt(cpu_ctx, vector);
     }
     ProcessDpcQueue(cpu_ctx);
@@ -440,11 +534,9 @@ void KeyboardDpc(void *data){
     }  
 }
 
-int KeyboardIsr(void *ctx){
-    CPU_CONTEXT *cpu_ctx = (CPU_CONTEXT *)ctx;
-    DEVICE *device = g_sys.devices[0]; 
+int KeyboardIsr(CPU_CONTEXT *cpu_ctx, ISR_CONTEXT *isr_ctx){
     printf("[ISR] Keyboard interrupt received\n");
-    QueueDpc(cpu_ctx, KeyboardDpc, device);
+    QueueDpc(cpu_ctx, KeyboardDpc, isr_ctx->device);
     return HANDLED;
 }
 
@@ -456,11 +548,9 @@ void MicrophoneDpc(void *data){
     } 
 }
 
-int MicrophoneIsr(void *ctx){
-    CPU_CONTEXT *cpu_ctx = (CPU_CONTEXT *)ctx;
-    DEVICE *device = g_sys.devices[2]; 
+int MicrophoneIsr(CPU_CONTEXT *cpu_ctx, ISR_CONTEXT *isr_ctx){
     printf("[ISR] Microphone interrupt received\n");
-    QueueDpc(cpu_ctx, MicrophoneDpc, device);
+    QueueDpc(cpu_ctx, MicrophoneDpc, isr_ctx->device);
     return HANDLED;
 }
 
@@ -472,22 +562,13 @@ void MouseDpc(void *data){
     }
 }
 
-int MouseIsr(void *ctx){
-    CPU_CONTEXT *cpu_ctx = (CPU_CONTEXT *)ctx;
-    DEVICE *device = g_sys.devices[1]; 
+int MouseIsr(CPU_CONTEXT *cpu_ctx, ISR_CONTEXT *isr_ctx){
     printf("[ISR] mouse interrupt received\n");
-    QueueDpc(cpu_ctx, MouseDpc, device);
+    QueueDpc(cpu_ctx, MouseDpc, isr_ctx->device);
     return HANDLED;
 }
 
-
-//test functions:
-int FakeHandler(void *ctx){
-    (void)ctx;
-    printf("[ISR] Not mine\n");
-    return NOT_HANDLED;
-}
-
+//Debug functions
 int IsLapic_id_n_owner(LAPIC *lapic){
     if(!lapic){
         LOG_FATAL("LAPIC is NULL\n");
@@ -544,7 +625,7 @@ void SystemInit(){
 
     g_sys.ioapic = calloc(1, sizeof(IOAPIC));
     if(!g_sys.ioapic){
-        puts("Memory allocation failed for IOAPIC instance");
+        LOG_HW("[HW]Memory allocation failed for IOAPIC instance");
         return;
     }
     
@@ -560,14 +641,13 @@ void SystemInit(){
 
     puts("System Running>>>");
     
-    RegisterInterrupt(33, KeyboardIsr);
-    RegisterInterrupt(34, MouseIsr);
-    RegisterInterrupt(35, MicrophoneIsr);
+    RegisterInterrupt(33, CommonInterruptEntry);
+    RegisterInterrupt(34, CommonInterruptEntry);
+    RegisterInterrupt(35, CommonInterruptEntry);
   
-    RegisterIsr(33, KeyboardIsr);
-    RegisterIsr(33, FakeHandler);
-    RegisterIsr(34, MouseIsr);
-    RegisterIsr(35, MicrophoneIsr);
+    RegisterIsr(33, KeyboardIsr, g_sys.devices[0]);
+    RegisterIsr(34, MouseIsr, g_sys.devices[1]);
+    RegisterIsr(35, MicrophoneIsr, g_sys.devices[2]);
 
     DeviceGenerateEvent(g_sys.devices[0], 101);
     DeviceGenerateEvent(g_sys.devices[1], 102);
