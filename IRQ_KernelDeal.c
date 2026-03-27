@@ -25,6 +25,7 @@ typedef struct _CPU_CONTEXT CPU_CONTEXT;
 typedef struct _LAPIC LAPIC;
 typedef struct _IOAPIC IOAPIC;
 typedef struct _DEVICE DEVICE;
+typedef struct _ISR_CONTEXT ISR_CONTEXT;
 typedef struct _DPC DPC;
     
 typedef struct _SYSTEM{
@@ -58,8 +59,16 @@ typedef struct _CPU_CONTEXT{
     DPC *dpc_tail;
 } CPU_CONTEXT;
 
+typedef struct _TIMER_EXT{
+    int interval;
+    int counter;
+} TIMER_EXT;
+
+static uint64_t g_system_ticks = 0;
+
 int RaiseIrql(CPU_CONTEXT *cpu_ctx, IRQL newIrql);
 void LowerIrql(CPU_CONTEXT *cpu_ctx, IRQL oldIrql);
+void DeviceRaiseInterrupt(DEVICE *device);
 
 //these are vector priority bitmap for to handle pending vector by lapic when more interrupt came at once
 static uint64_t g_vector_priority_Table[MAX_VECTOR_PRIORITY];
@@ -127,6 +136,7 @@ typedef struct _DEVICE{
     MSI_CONFIG msi;
     IRQ_CONFIG irq;
     int use_msi;
+    void *ext;
     RING_BUFFER buffer;
 } DEVICE;
 
@@ -254,6 +264,7 @@ DEVICE* CreateDevice(const char *name, const MSI_CAP *msi_cap){
     device->msi_cap = msi_cap;
     device->msi.enabled = 0;
     device->use_msi = 0;
+    device->ext = 0;
     device->irq.irq_line = -1;
     device->buffer.head = device->buffer.tail = 0;
     return device;
@@ -270,6 +281,7 @@ void SetupIoApicRoute(int irq, int vector, int cpu_id){
     g_sys.ioapic->routes[irq].target_cpu = cpu_id;
 }
 
+//Needed to fix later when multi CPU core campability introduce
 void ConfigureDevice(DEVICE *device, CPU *cpu, int vector){
     if(!device || !cpu){
         LOG_FATAL("Invalid device or CPU in ConfigureDevice\n");
@@ -299,6 +311,14 @@ void ConfigureDevice(DEVICE *device, CPU *cpu, int vector){
 }
 
 void DevicePool(){
+    DEVICE *timer = CreateDevice("timer", &msi_cap_1vec);
+    ConfigureDevice(timer, g_sys.cpus[0], 40);
+    
+    TIMER_EXT *ext = calloc(1, sizeof(TIMER_EXT));
+    ext->interval = 3;
+    timer->ext = ext;
+    g_sys.devices[g_sys.d_count++] = timer;
+    
     DEVICE *keyboard = CreateDevice("keyboard", &msi_cap_1vec);
     ConfigureDevice(keyboard, g_sys.cpus[0], 33);
     g_sys.devices[g_sys.d_count++] = keyboard;
@@ -362,7 +382,7 @@ void DeviceGenerateEvent(DEVICE *device, int value){
     DeviceRaiseInterrupt(device);
 }
 
-typedef struct{
+typedef struct _ISR_CONTEXT{
     DEVICE *device;
 } ISR_CONTEXT;
 
@@ -526,6 +546,24 @@ void LowerIrql(CPU_CONTEXT *cpu_ctx, IRQL oldIrql){
 }
 
 //These are dirvers
+
+void TimerStep(DEVICE *timer){
+    TIMER_EXT *time = (TIMER_EXT *)timer->ext;
+    time->counter++;
+    if(time->counter >= time->interval){
+        time->counter = 0;
+        DeviceRaiseInterrupt(timer);
+    }
+}
+
+int TimerIsr(CPU_CONTEXT *cpu_ctx, ISR_CONTEXT *isr_ctx){
+    (void)cpu_ctx;
+    (void)isr_ctx;
+    g_system_ticks++;
+    printf("\n[TIMER ISR] Ticks = %llu\n", g_system_ticks);
+    return HANDLED;
+}
+
 void KeyboardDpc(void *data){
     DEVICE *device = (DEVICE *)data;
     int value;
@@ -640,25 +678,41 @@ void SystemInit(){
            g_sys.c_count, g_sys.d_count);
 
     puts("System Running>>>");
-    
+
+    RegisterInterrupt(40, CommonInterruptEntry);
     RegisterInterrupt(33, CommonInterruptEntry);
     RegisterInterrupt(34, CommonInterruptEntry);
     RegisterInterrupt(35, CommonInterruptEntry);
-  
-    RegisterIsr(33, KeyboardIsr, g_sys.devices[0]);
-    RegisterIsr(34, MouseIsr, g_sys.devices[1]);
-    RegisterIsr(35, MicrophoneIsr, g_sys.devices[2]);
 
-    DeviceGenerateEvent(g_sys.devices[0], 101);
-    DeviceGenerateEvent(g_sys.devices[1], 102);
-    DeviceGenerateEvent(g_sys.devices[2], 103);
-    DeviceGenerateEvent(g_sys.devices[0], 106);
- 
+    RegisterIsr(40, TimerIsr, g_sys.devices[0]);
+    RegisterIsr(33, KeyboardIsr, g_sys.devices[1]);
+    RegisterIsr(34, MouseIsr, g_sys.devices[2]);
+    RegisterIsr(35, MicrophoneIsr, g_sys.devices[3]);
+
+    
     DumpLAPIC(g_sys.cpus[0]->lapic);
+    
+    DEVICE *timer = g_sys.devices[0];
+    printf("\t\x1b[32m-----Timer-Ticks-----\x1b[0m\n");
+    
+    for(int tick = 0; tick < 10; tick++){
+        printf("\t\x1b[34m-----Tick = %d-----\x1b[0m\n", tick);
+        TimerStep(timer);
+        if(tick == 0)
+            DeviceGenerateEvent(g_sys.devices[1], 101);
+        
+        if(tick == 3)
+            DeviceGenerateEvent(g_sys.devices[2], 102);
+        
+        if(tick == 5)
+              DeviceGenerateEvent(g_sys.devices[3], 103);
 
-    int i = 0;
-    while(i < g_sys.c_count){
-        CpuStep(g_sys.context[i++]);
+        if(tick == 8)
+             DeviceGenerateEvent(g_sys.devices[1], 106);
+        
+        for(int i = 0; i < g_sys.c_count; i++){
+            CpuStep(g_sys.context[i]);
+        }
     }
 
     puts("System Terminated>>>");
