@@ -71,8 +71,8 @@ Drivers interact with devices via:
 ---
 
 ## Architecture diagram
-
-![PCI Diagram](PCIDeviceMgnWorkflow.png)
+### PCI Enumeration Flow
+<img src="PCIDeviceMgnWorkflow.png" width="600">
 
 ---
 
