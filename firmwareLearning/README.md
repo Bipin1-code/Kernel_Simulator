@@ -64,9 +64,12 @@ Simulates:
 
 ### Basic Driver Model
 Simple driver attachment based on class code:
-`AttachDriver()`
+```c
+AttachDriver()`
+```
 Drivers interact with devices via:
-`TestDevice()`
+```c
+TestDevice()
 
 ---
 
