@@ -3,6 +3,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
+#include <inttypes.h>
 
 //Log each output
 #define LOG_INFO(msg) \
@@ -36,9 +37,10 @@
         } \
     } while(0)
 
-#define MAX_BUS 2
+#define MAX_BUS 2   //256 in real but for test it's 2
 #define MAX_DEVICE 32
 #define MAX_FUNCTION 8
+#define MAX_REAL_DEVICE 8192 //256 * 32 (It depends on PCI_config space, I am assume 16MB(classic))
 
 #pragma pack(push, 1)
 typedef struct _PCI_CONFIG_SPACE{
@@ -102,6 +104,7 @@ typedef struct _PCI_HEADER_TYPE1{
 
 typedef struct _PCI_DEVICE{
     PCI_CONFIG_SPACE config;
+    uint64_t bar_size[6]; //hardware internal address decode circuitry mimic
 } PCI_DEVICE;
 #pragma pack(pop)
 
@@ -116,6 +119,9 @@ PCI_DEVICE* CreatePciDevice(const char *name){
     for(int byte = 0; byte < 256; byte++)
         device->config.data[byte] = 0;
 
+    for(int i = 0; i < 6; i++)
+        device->bar_size[i] = 0;
+    
     return device;
 }
 
@@ -157,7 +163,11 @@ void SetupType0Header(PCI_DEVICE *device, uint16_t id){
     for(int i = 0; i < 6; i++)
         type->bar[i] = 0x00;
     
-    type->bar[0] = 0x1000;
+    type->bar[0] = 0x00001004;
+    device->bar_size[0] = 0x2000;
+    type->bar[1] = 0x00000000;
+    device->bar_size[1] = 0;
+    
     type->carbus_cis_ptr = 0x00; 
     type->subsystem_vendor_id = id;
     type->subsystem_id = id;
@@ -180,8 +190,9 @@ void SetupType1Header(PCI_DEVICE *device, uint16_t mmL){
     uint8_t *data = device->config.data;
     PCI_HEADER_TYPE1 *type = (PCI_HEADER_TYPE1 *)(data + 0x10);
 
-    type->bar[0] = 0x00000000;
-    type->bar[1] = 0x00000000;
+    device->bar_size[0] = 0x4000;
+    type->bar[0] = 0x1000;
+
     type->primary_bus = 0x00;
     type->secondary_bus = 1;
     type->subordinate_bus = 1;
@@ -223,11 +234,12 @@ PCI_DEVICE* CreateFakeDevice(const char *name, uint8_t type, uint8_t subclass, u
     return device;
 }
 
+//I need change in here and createFakeDevice later (not huge)
 void PciDevicePool(){
     g_pci_bus[0][0][0] = CreateFakeDevice("disk", 0, 0x06, 0x01, 0x01, 0);
     g_pci_bus[0][1][0] = CreateFakeDevice("net",  0, 0x00, 0x02, 0x00, 0);
-    g_pci_bus[0][2][0] = CreateFakeDevice("bridge", 1, 0x04, 0x06, 0x00, 0);
     g_pci_bus[1][0][0] = CreateFakeDevice("gpu", 0, 0x00, 0x03, 0x00, 0);
+    g_pci_bus[0][2][0] = CreateFakeDevice("bridge", 1, 0x04, 0x06, 0x00, 0);
 }
 
 uint16_t PciReadVendor(uint8_t bus, uint8_t dev, uint8_t func){
@@ -240,29 +252,291 @@ uint16_t PciReadVendor(uint8_t bus, uint8_t dev, uint8_t func){
     return *(uint16_t *)(data + 0x00);
 }
 
+//Debugging
+void DumpPciConfig(uint8_t *data){
+    for(int i = 0; i < 256; i += 16){
+        printf("%02X: ", i);
+
+        for(int j = 0; j < 16; j++){
+            printf("%02X ", data[i + j]);
+        }
+        printf("\n");
+    }
+}
+
+void DumpPciDevice(uint8_t bus, uint8_t dev, uint8_t func){
+    PCI_DEVICE *device = g_pci_bus[bus][dev][func];
+    if(!device){
+        LOG_WARN("Attempt to dump NULL device");
+        return;
+    }
+    printf("\n=== PCI CONFIG DUMP ====\n");
+    printf("Bus=%d Dev=%d Func=%d\n", bus, dev, func);
+
+    DumpPciConfig(device->config.data);
+}
+
+void DecodeBar(uint32_t bar){
+    if(bar & 1){
+        LOG_INFO("IO BAR");
+        printf("Address: 0x%X\n", (bar & ~0x3));
+    }else{
+        LOG_INFO("Memory BAR");
+        uint32_t type = (bar >> 1) & 0x3;
+        if(type == 0)
+            LOG_INFO("32-bit");
+        else if(type == 2)
+            LOG_INFO("64-bit");
+
+        printf("Address: 0x%X\n", (bar & ~0xf));
+    }
+}
+
+//New idea:
+typedef struct _PCI_BAR_INFO{
+    uint64_t base_address;
+    uint64_t size;
+    uint8_t is_io;
+    uint8_t is_64bit;
+} PCI_BAR_INFO;
+
+typedef struct _PCI_DEVICE_CONTEXT{
+    PCI_DEVICE *h_dev;
+    uint8_t bus;
+    uint8_t dev;
+    uint8_t func;
+    uint16_t vendor_id;
+    uint16_t device_id;
+    uint8_t prog_if;
+    uint8_t subclass;
+    uint8_t class_code;
+    uint8_t header_type;
+
+    union{
+        uint32_t type0_bars[6];
+        uint32_t type1_bars[2];
+    } select_bar;
+    
+    PCI_BAR_INFO bar_info[6];    
+} PCI_DEVICE_CONTEXT;
+
+PCI_DEVICE_CONTEXT *g_pciDevCtx[MAX_REAL_DEVICE];
+int g_dev_count = 0;
+
+uint32_t PciConfigRead32(uint8_t bus, uint8_t dev, uint8_t func, uint8_t offset){
+    PCI_DEVICE *device = g_pci_bus[bus][dev][func];
+    if(!device) return 0xffffffff;
+    return *(uint32_t *)(device->config.data + offset);
+}
+
+uint32_t PciConfigWrite32(uint8_t bus, uint8_t dev, uint8_t func, uint8_t offset, uint32_t value){
+    PCI_DEVICE *device = g_pci_bus[bus][dev][func];
+    if(!device) return 0xffffffff;
+    if(offset >= 0x10 && offset < 0x28){
+        /* Mapping config-space offset -> BAR index */
+        int bar_index = (offset - 0x10) / 4;
+        uint32_t orig = *(uint32_t *)(device->config.data + offset);
+        uint32_t type = (orig >> 1) & 0x3;
+        int is_64 = (type == 2);
+        if(value ==  0xffffffff){
+            uint32_t size = device->bar_size[bar_index];
+            if(size == 0){
+                *(uint32_t *)(device->config.data + offset) = 0;
+                return 0;
+            }
+            if(orig & 1){
+                //Type = IO BAR 
+                *(uint32_t *)(device->config.data + offset) =
+                    ~(size - 1) | 0x1;
+            }else{
+                //Memory BAR
+                uint64_t size64 = device->bar_size[bar_index];
+                uint64_t mask64 = ~(size64 - 1);
+
+                uint32_t low  = (uint32_t)(mask64 & 0xFFFFFFFF);
+                uint32_t high = (uint32_t)(mask64 >> 32);
+
+                uint32_t orig_low = orig;
+                int is_low = ((offset - 0x10) % 8 == 0);
+
+                if(is_64){
+                    if(is_low){
+                        *(uint32_t *)(device->config.data + offset) =
+                            (low & ~0xF) | (orig_low & 0xF);
+                    }else{
+                        *(uint32_t *)(device->config.data + offset) = high;
+                    }
+                }else{
+                    *(uint32_t *)(device->config.data + offset) =
+                        (low & ~0xF) | (orig_low & 0xF);
+                }
+            }
+            return 0;
+        }
+    }
+    *(uint32_t *)(device->config.data + offset) = value;
+    return 0;
+}
+
+PCI_BAR_INFO GetPciBarInfo(uint8_t bus, uint8_t dev, uint8_t func, uint32_t bar){
+    PCI_BAR_INFO pbi = {0};
+
+    uint8_t offset = 0x10 + bar * 4;
+    //original 
+    uint32_t orig_low = PciConfigRead32(bus, dev, func, offset);
+    if(orig_low == 0) return pbi;
+
+    uint32_t orig_high = 0;
+    uint32_t type = (orig_low >> 1) & 0x3;
+    uint8_t is_64 = (type == 2);
+    if(is_64){
+        orig_high = PciConfigRead32(bus, dev, func, offset + 4);
+    }
+    
+    PciConfigWrite32(bus, dev, func, offset, 0xffffffff);
+    uint32_t size_low = PciConfigRead32(bus, dev, func, offset);
+    uint32_t size_high = 0;
+    if(is_64){
+        PciConfigWrite32(bus, dev, func, offset + 4, 0xffffffff);
+        size_high = PciConfigRead32(bus, dev, func, offset + 4);
+    }
+    printf("DEBUG:(Response) size_low=0x%X size_high=0x%X\n", size_low, size_high);
+
+    //Restore
+    PciConfigWrite32(bus, dev, func, offset, orig_low);
+    if(is_64){
+        PciConfigWrite32(bus, dev, func, offset + 4, orig_high);
+    }
+
+    //Finall get all info about bar and them
+    if(orig_low & 1){
+        pbi.size = ~(size_low & ~0x3) + 1;
+        pbi.base_address = (orig_low & ~0x3);
+        pbi.is_io = 1;
+    }else{
+        pbi.is_64bit = is_64;
+        uint64_t base = (orig_low & ~0xf);
+        uint64_t size = ~(size_low & ~0xf) + 1;
+        if(is_64){
+            if(orig_high == 0 && size_high == 0){
+                // Treat as broken/fake -> fallback to 32-bit
+                pbi.base_address = (orig_low & ~0xf);
+                pbi.size = ~(size_low & ~0xf) + 1;
+            }else{
+                base |= ((uint64_t)orig_high << 32);
+                uint64_t mask = ((uint64_t)(size_low & ~0xf) |
+                                 ((uint64_t)size_high << 32));
+                pbi.base_address = base;
+                pbi.size = ~mask + 1;
+            }
+        }
+        else{
+            pbi.base_address = base;
+            pbi.size = size;
+        }   
+    }
+    return pbi;
+}
+
+PCI_DEVICE_CONTEXT* OsCreateDevice(const uint8_t bus, const uint8_t dev, const  uint8_t func){
+    PCI_DEVICE_CONTEXT *dev_ctx = malloc(sizeof(PCI_DEVICE_CONTEXT));
+    if(!dev_ctx){
+        LOG_ERROR("Failed to allocate memory for PCI_DEVICE_CONTEXT");
+        return NULL; 
+    }
+    
+    dev_ctx->h_dev = g_pci_bus[bus][dev][func];
+    uint8_t *data = dev_ctx->h_dev->config.data;
+    dev_ctx->bus = bus;
+    dev_ctx->dev = dev;
+    dev_ctx->func = func;
+    dev_ctx->vendor_id = *(uint16_t *)(data + 0x00);
+    dev_ctx->device_id = *(uint16_t *)(data + 0x02); 
+    dev_ctx->prog_if = *(uint8_t *)(data + 0x09);
+    dev_ctx->subclass = *(uint8_t *)(data + 0x0A);
+    dev_ctx->class_code = *(uint8_t *)(data + 0x0B);
+    dev_ctx->header_type = *(uint8_t *)(data + 0x0E) & 0x7F;
+    
+    uint32_t *bars = (uint32_t *)(data + 0x10);
+    if(dev_ctx->header_type == 1){
+        for(int b = 0; b < 2; b++){
+            dev_ctx->select_bar.type1_bars[b] = bars[b];
+            dev_ctx->bar_info[b] = GetPciBarInfo(bus, dev, func, b);
+            if(dev_ctx->bar_info[b].is_64bit){
+                b++;
+            }
+        }
+    }else{
+        for(int b = 0; b < 6; b++){
+            dev_ctx->select_bar.type0_bars[b] = bars[b];
+            dev_ctx->bar_info[b] = GetPciBarInfo(bus, dev, func, b);
+            if(dev_ctx->bar_info[b].is_64bit){
+                b++;
+            }
+        }
+    }
+    
+    //Debug print
+    int limit;
+    if(dev_ctx->header_type == 1)
+        limit = 2;
+    else
+        limit = 6;
+    
+    for(int b = 0; b < limit; b++){
+        PCI_BAR_INFO *bi = &dev_ctx->bar_info[b]; 
+        if(bi->base_address == 0){
+            b++;
+            continue;   
+        }
+        printf("BAR%d:\n", b);
+        if(bi->is_64bit){
+            printf(" (64-bit)\n");
+        }
+        printf(" Type: %s\n", bi->is_io ? "IO" : "Memory");
+        printf(" Address: 0x%" PRIx64 "\n", bi->base_address);
+        printf(" Size: %"  PRIu64 "\n", bi->size);
+
+        b += (bi->is_64bit) ? 2 : 1;
+    }
+    
+    printf("Vendor: 0x%X Device: 0x%X\n", dev_ctx->vendor_id, dev_ctx->device_id);
+    printf("Class: 0x%X Subclass: 0x%X\n", dev_ctx->class_code, dev_ctx->subclass);
+
+    return dev_ctx;
+}
+
 void PciScanBus(uint8_t bus){
     for(int dev = 0; dev < MAX_DEVICE; dev++){ 
         for(int func = 0; func < MAX_FUNCTION; func++){
+            if(func == 0){
+                uint16_t vendor = PciReadVendor(bus, dev, 0);
+                if(vendor == 0xFFFF)
+                    break;
+            }
             uint16_t vendor = PciReadVendor(bus, dev, func);
-            if(vendor == 0xffff)
-                continue;
+            if(vendor == 0xffff) continue;
             
             LOG_INFO("PCI DEVICE FOUND");
             LOG_INFO_FMT("Bus=%d, Dev= %d, func= %d", bus, dev, func);
 
+            DumpPciDevice(bus, dev, func);
+
+            //New block a.c.t new design 
+            PCI_DEVICE_CONTEXT *ctx = OsCreateDevice(bus, dev, func);
+            if(ctx){
+                KASSERT(g_dev_count < MAX_REAL_DEVICE, "INVALID count of device");
+                g_pciDevCtx[g_dev_count++] = ctx;
+            }
+            
             PCI_DEVICE *device = g_pci_bus[bus][dev][func];
             uint8_t *data = device->config.data;
-            uint16_t device_id = *(uint16_t *)(data + 0x02);
-            uint8_t class_code = *(uint8_t *)(data + 0x0B);
-            uint8_t sub_code = *(uint8_t *)(data + 0x0A);
-            printf("Vendor: 0x%X Device: 0x%X\n", vendor, device_id);
-            printf("Class: 0x%X Subclass: 0x%X\n", class_code, sub_code);
             uint8_t header = *(uint8_t *)(data + 0x0E) & 0x7F;
-
+            
             if(header == 1){
                 LOG_INFO("Bridge device detected");
-                    
                 PCI_HEADER_TYPE1 *h1 = (PCI_HEADER_TYPE1 *)(data + 0x10);
+    
                 if(h1->secondary_bus != bus && h1->secondary_bus < MAX_BUS){
                     LOG_INFO_FMT("Scanning Secondary Bus %d", h1->secondary_bus);
                     PciScanBus(h1->secondary_bus);
@@ -273,7 +547,7 @@ void PciScanBus(uint8_t bus){
 }
 
 void PciEnumerate(){
-            PciScanBus(0);
+    PciScanBus(0);
 }
 
 int main(){
