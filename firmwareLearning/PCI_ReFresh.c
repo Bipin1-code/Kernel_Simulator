@@ -40,7 +40,7 @@
 #define MAX_BUS 2   //256 in real but for test it's 2
 #define MAX_DEVICE 32
 #define MAX_FUNCTION 8
-#define MAX_REAL_DEVICE 8192 //256 * 32 (It depends on PCI_config space, I am assume 16MB(classic))
+#define MAX_REAL_DEVICE 8192 //256 * 32 (It depends on PCI_config space, 16MB(classic))
 
 #pragma pack(push, 1)
 typedef struct _PCI_CONFIG_SPACE{
@@ -110,6 +110,16 @@ typedef struct _PCI_DEVICE{
 
 PCI_DEVICE *g_pci_bus[MAX_BUS][MAX_DEVICE][MAX_FUNCTION];
 
+//start
+//this struct is only for to help initialisation
+//this is not PCI Device expose part for OS or BIOS/UFEI
+typedef struct{
+    uint64_t size;
+    uint8_t is_io;
+    uint8_t is_64;
+} BAR_CFG;
+//end
+
 PCI_DEVICE* CreatePciDevice(const char *name){
     PCI_DEVICE *device = malloc(sizeof(PCI_DEVICE));
     if(!device){
@@ -156,18 +166,31 @@ void SetupCommonHeader(PCI_DEVICE *device, uint16_t id, uint8_t type, uint8_t su
     KASSERT(sizeof(PCI_COMMON_HEADER) == 16, "Common header broken");
 }
 
-void SetupType0Header(PCI_DEVICE *device, uint16_t id){
+void SetupType0Header(PCI_DEVICE *device, uint16_t id, BAR_CFG *bars){
     uint8_t *data = device->config.data;
     PCI_HEADER_TYPE0 *type = (PCI_HEADER_TYPE0 *)(data + 0x10);
     
-    for(int i = 0; i < 6; i++)
-        type->bar[i] = 0x00;
-    
-    type->bar[0] = 0x00001004;
-    device->bar_size[0] = 0x2000;
-    type->bar[1] = 0x00000000;
-    device->bar_size[1] = 0;
-    
+    for(int i = 0; i < 6; i++){
+        if(bars[i].size == 0){
+            type->bar[i] = 0;
+            device->bar_size[i] = 0;
+            continue;
+        }
+        device->bar_size[i] = bars[i].size;
+        uint32_t flags = 0;
+        if(bars[i].is_io){
+            flags |= 0x1;
+        }else{
+            if(bars[i].is_64)
+                flags |= (2 << 1);
+        }
+        type->bar[i] = flags;
+        if(bars[i].is_64){
+            i++;
+            type->bar[i] = 0;
+        }
+    }
+
     type->carbus_cis_ptr = 0x00; 
     type->subsystem_vendor_id = id;
     type->subsystem_id = id;
@@ -186,13 +209,31 @@ void SetupType0Header(PCI_DEVICE *device, uint16_t id){
     KASSERT(sizeof(PCI_HEADER_TYPE0) == 48, "Type0 broken");
 }
 
-void SetupType1Header(PCI_DEVICE *device, uint16_t mmL){
+void SetupType1Header(PCI_DEVICE *device, uint16_t mmL, BAR_CFG *bars){
     uint8_t *data = device->config.data;
     PCI_HEADER_TYPE1 *type = (PCI_HEADER_TYPE1 *)(data + 0x10);
 
-    device->bar_size[0] = 0x4000;
-    type->bar[0] = 0x1000;
-
+    for(int i = 0; i < 2; i++){
+        if(bars[i].size == 0){
+            type->bar[i] = 0;
+            device->bar_size[i] = 0;
+            continue;
+        }
+        device->bar_size[i] = bars[i].size;
+        uint32_t flags = 0;
+        if(bars[i].is_io){
+            flags |= 0x1;
+        }else{
+            if(bars[i].is_64)
+                flags |= (2 << 1);
+        }
+        type->bar[i] = flags;
+        if(bars[i].is_64){
+            i++;
+            type->bar[i] = 0;
+        }
+    }
+    
     type->primary_bus = 0x00;
     type->secondary_bus = 1;
     type->subordinate_bus = 1;
@@ -216,8 +257,8 @@ void SetupType1Header(PCI_DEVICE *device, uint16_t mmL){
     KASSERT(sizeof(PCI_HEADER_TYPE1) == 48, "Type1 broken");
 }
 
-PCI_DEVICE* CreateFakeDevice(const char *name, uint8_t type, uint8_t subclass, uint8_t classcode,
-                             uint8_t prog_if, uint16_t mmL){
+PCI_DEVICE* CreateFakeDevice(const char *name, uint8_t type, uint8_t subclass,
+                             uint8_t classcode, uint8_t prog_if, uint16_t mmL, BAR_CFG *bars){
     PCI_DEVICE *device = CreatePciDevice(name);
     if(!device){
         LOG_ERROR_FMT("Failed to initialize PCI_DEVICE %s", name);
@@ -227,19 +268,37 @@ PCI_DEVICE* CreateFakeDevice(const char *name, uint8_t type, uint8_t subclass, u
     SetupCommonHeader(device, id, type, subclass, classcode, prog_if);
     if(type == 0){
         (void)mmL;
-        SetupType0Header(device, id);
+        SetupType0Header(device, id, bars);
     }else
-        SetupType1Header(device, mmL);
+        SetupType1Header(device, mmL, bars);
     
     return device;
 }
 
-//I need change in here and createFakeDevice later (not huge)
 void PciDevicePool(){
-    g_pci_bus[0][0][0] = CreateFakeDevice("disk", 0, 0x06, 0x01, 0x01, 0);
-    g_pci_bus[0][1][0] = CreateFakeDevice("net",  0, 0x00, 0x02, 0x00, 0);
-    g_pci_bus[1][0][0] = CreateFakeDevice("gpu", 0, 0x00, 0x03, 0x00, 0);
-    g_pci_bus[0][2][0] = CreateFakeDevice("bridge", 1, 0x04, 0x06, 0x00, 0);
+    BAR_CFG disk_bars[6] = {
+        {0x2000, 0, 0},
+        {0},
+    };
+
+    BAR_CFG net_bars[6] = {
+        {0x4000, 0, 1},
+        {0},
+    };
+
+    BAR_CFG gpu_bars[6] = {
+        {0x100000, 0, 1},
+        {0},
+    };
+
+    BAR_CFG bridge_bars[2] = {
+        {0x4000, 0, 0},
+    };
+    
+    g_pci_bus[0][0][0] = CreateFakeDevice("disk", 0, 0x06, 0x01, 0x01, 0, disk_bars);
+    g_pci_bus[0][1][0] = CreateFakeDevice("net",  0, 0x00, 0x02, 0x00, 0, net_bars);
+    g_pci_bus[1][0][0] = CreateFakeDevice("gpu", 0, 0x00, 0x03, 0x00, 0, gpu_bars);
+    g_pci_bus[0][2][0] = CreateFakeDevice("bridge", 1, 0x04, 0x06, 0x00, 0, bridge_bars);
 }
 
 uint16_t PciReadVendor(uint8_t bus, uint8_t dev, uint8_t func){
@@ -252,7 +311,7 @@ uint16_t PciReadVendor(uint8_t bus, uint8_t dev, uint8_t func){
     return *(uint16_t *)(data + 0x00);
 }
 
-//Debugging
+//Debugging functions 
 void DumpPciConfig(uint8_t *data){
     for(int i = 0; i < 256; i += 16){
         printf("%02X: ", i);
@@ -270,27 +329,12 @@ void DumpPciDevice(uint8_t bus, uint8_t dev, uint8_t func){
         LOG_WARN("Attempt to dump NULL device");
         return;
     }
-    printf("\n=== PCI CONFIG DUMP ====\n");
+    printf("=== PCI CONFIG DUMP ====\n");
     printf("Bus=%d Dev=%d Func=%d\n", bus, dev, func);
 
     DumpPciConfig(device->config.data);
 }
-
-void DecodeBar(uint32_t bar){
-    if(bar & 1){
-        LOG_INFO("IO BAR");
-        printf("Address: 0x%X\n", (bar & ~0x3));
-    }else{
-        LOG_INFO("Memory BAR");
-        uint32_t type = (bar >> 1) & 0x3;
-        if(type == 0)
-            LOG_INFO("32-bit");
-        else if(type == 2)
-            LOG_INFO("64-bit");
-
-        printf("Address: 0x%X\n", (bar & ~0xf));
-    }
-}
+//end
 
 //New idea:
 typedef struct _PCI_BAR_INFO{
@@ -362,13 +406,13 @@ uint32_t PciConfigWrite32(uint8_t bus, uint8_t dev, uint8_t func, uint8_t offset
                 if(is_64){
                     if(is_low){
                         *(uint32_t *)(device->config.data + offset) =
-                            (low & ~0xF) | (orig_low & 0xF);
+                            (low & ~0xf) | (orig_low & 0xf);
                     }else{
                         *(uint32_t *)(device->config.data + offset) = high;
                     }
                 }else{
                     *(uint32_t *)(device->config.data + offset) =
-                        (low & ~0xF) | (orig_low & 0xF);
+                        (low & ~0xf) | (orig_low & 0xf);
                 }
             }
             return 0;
@@ -384,7 +428,6 @@ PCI_BAR_INFO GetPciBarInfo(uint8_t bus, uint8_t dev, uint8_t func, uint32_t bar)
     uint8_t offset = 0x10 + bar * 4;
     //original 
     uint32_t orig_low = PciConfigRead32(bus, dev, func, offset);
-    if(orig_low == 0) return pbi;
 
     uint32_t orig_high = 0;
     uint32_t type = (orig_low >> 1) & 0x3;
@@ -395,6 +438,9 @@ PCI_BAR_INFO GetPciBarInfo(uint8_t bus, uint8_t dev, uint8_t func, uint32_t bar)
     
     PciConfigWrite32(bus, dev, func, offset, 0xffffffff);
     uint32_t size_low = PciConfigRead32(bus, dev, func, offset);
+    if(size_low == 0){
+        return pbi; //this is unsed bar so pbi is {0} for all field,
+    }
     uint32_t size_high = 0;
     if(is_64){
         PciConfigWrite32(bus, dev, func, offset + 4, 0xffffffff);
@@ -483,9 +529,9 @@ PCI_DEVICE_CONTEXT* OsCreateDevice(const uint8_t bus, const uint8_t dev, const  
     else
         limit = 6;
     
-    for(int b = 0; b < limit; b++){
+    for(int b = 0; b < limit;){
         PCI_BAR_INFO *bi = &dev_ctx->bar_info[b]; 
-        if(bi->base_address == 0){
+        if(bi->size == 0){
             b++;
             continue;   
         }
@@ -516,13 +562,12 @@ void PciScanBus(uint8_t bus){
             }
             uint16_t vendor = PciReadVendor(bus, dev, func);
             if(vendor == 0xffff) continue;
-            
+            puts("\n");
             LOG_INFO("PCI DEVICE FOUND");
             LOG_INFO_FMT("Bus=%d, Dev= %d, func= %d", bus, dev, func);
 
             DumpPciDevice(bus, dev, func);
 
-            //New block a.c.t new design 
             PCI_DEVICE_CONTEXT *ctx = OsCreateDevice(bus, dev, func);
             if(ctx){
                 KASSERT(g_dev_count < MAX_REAL_DEVICE, "INVALID count of device");
