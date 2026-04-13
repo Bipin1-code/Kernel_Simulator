@@ -6,13 +6,35 @@
 #include <stdint.h>
 #include <inttypes.h>
 
-#define MAX_REAL_DEVICE 8192 //256 * 32 (It depends on PCI_config space, 16MB(classic))
-
 PCI_DEVICE_CONTEXT *g_pciDevCtx[MAX_REAL_DEVICE];
 int g_dev_count = 0;
 
+static void (*fgNewDeviceNotifier)(PCI_DEVICE_CONTEXT *device) = NULL;
+
+void OS_RegisterDeviceFoundCallback(void (*callback)(PCI_DEVICE_CONTEXT *)){
+    fgNewDeviceNotifier = callback;
+}
+
+static void* DeviceGetBarMemory(PCI_DEVICE_CONTEXT *ctx, int bar_index){
+    if(!ctx || bar_index < 0 || bar_index >= 6)
+        return NULL;
+    
+    return PciGetBarMemory(ctx->bus, ctx->dev, ctx->func, bar_index);
+}
+
+static uint64_t DeviceBarRead(PCI_DEVICE_CONTEXT *ctx, int bar, uint64_t offset,
+                              int size){
+    if(!ctx) return 0;
+    return PciReadBar(ctx->bus, ctx->dev, ctx->func, bar, offset, size);
+}
+
+static void DeviceBarWrite(PCI_DEVICE_CONTEXT *ctx, int bar, uint64_t offset,
+                           uint64_t value, int size){
+    PciWriteBar(ctx->bus, ctx->dev, ctx->func, bar, offset, value, size);
+}
+
 PCI_DEVICE_CONTEXT* DeviceCreateFromPci(const uint8_t bus, const uint8_t dev,
-                                   const  uint8_t func){
+                                        const uint8_t func){
 
     PCI_DEVICE_CONTEXT *dev_ctx = calloc(1, sizeof(PCI_DEVICE_CONTEXT));
     if(!dev_ctx){
@@ -42,11 +64,14 @@ PCI_DEVICE_CONTEXT* DeviceCreateFromPci(const uint8_t bus, const uint8_t dev,
         dev_ctx->bar_info[b] = bi;
         uint32_t raw = PciConfigRead32(bus, dev, func, (0x10 + b * 4));
                 
-        if(dev_ctx->header_type == 1 && b < 2)
-            dev_ctx->select_bar.type1_bars[b] = raw;
-        else
-            dev_ctx->select_bar.type0_bars[b] = raw;
-        
+        if(dev_ctx->header_type == 1){
+            if(b < 2 )
+                dev_ctx->select_bar.type1_bars[b] = raw;
+        }else{
+            if(b < 6)
+                dev_ctx->select_bar.type0_bars[b] = raw;
+        }
+            
         if(bi.size == 0){
             b++;
             continue;
@@ -67,14 +92,26 @@ PCI_DEVICE_CONTEXT* DeviceCreateFromPci(const uint8_t bus, const uint8_t dev,
     printf("Class: 0x%02X Subclass: 0x%02X\n", dev_ctx->class_code, dev_ctx->subclass);
     printf("Revision_ID: 0x%02X\n", dev_ctx->revision_id);
     printf("Header Type: 0x%02X\n", dev_ctx->header_type);
+
+    //new field iniliatize
+    dev_ctx->driver = NULL;
+    dev_ctx->device_data = NULL;
+
+    dev_ctx->fBarGetMem = DeviceGetBarMemory;
+    dev_ctx->fBarRead = DeviceBarRead;
+    dev_ctx->fBarWrite = DeviceBarWrite;
     
     return dev_ctx;
 }
 
-void OnPciDeviceFound(uint8_t bus, uint8_t dev, uint8_t func){
+void OS_HandleNewPciDevice(const uint8_t bus, const uint8_t dev, const uint8_t func){
      PCI_DEVICE_CONTEXT *ctx = DeviceCreateFromPci(bus, dev, func);
      if(ctx){
          KASSERT(g_dev_count < MAX_REAL_DEVICE, "INVALID count of device");
          g_pciDevCtx[g_dev_count++] = ctx;
+     
+         if(fgNewDeviceNotifier){
+             fgNewDeviceNotifier(ctx);
+         }
      }
 }

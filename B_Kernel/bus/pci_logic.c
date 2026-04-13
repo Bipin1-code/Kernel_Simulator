@@ -1,6 +1,7 @@
 
 #include "pci_logic.h"
 #include "pci_sim.h"
+#include "pci_sim_internal.h"
 #include "log.h"
 #include <stdio.h>
 #include <stdint.h>
@@ -12,11 +13,6 @@ typedef struct _PCI_BAR_INFO{
     uint8_t is_io;
     uint8_t is_64bit;
 } PCI_BAR_INFO;
-
-uint8_t* PciSimGetConfig(uint8_t bus, uint8_t dev, uint8_t func);
-
-uint64_t PciSimGetBarSize(uint8_t bus, uint8_t dev, uint8_t func,
-                          int bar_index);
 
 uint16_t PciReadVendor(uint8_t bus, uint8_t dev, uint8_t func){
     PCI_DEVICE *device = g_pci_bus[bus][dev][func];
@@ -33,8 +29,8 @@ uint32_t PciConfigRead32(uint8_t bus, uint8_t dev, uint8_t func, uint8_t offset)
     return *(uint32_t *)(PciSimGetConfig(bus, dev, func) + offset);
 }
 
-uint32_t PciConfigWrite32(uint8_t bus, uint8_t dev, uint8_t func, uint8_t offset,
-                          uint32_t value){
+uint32_t PciConfigWrite32(uint8_t bus, uint8_t dev, uint8_t func,
+                          uint8_t offset, uint32_t value){
     PCI_DEVICE *device = g_pci_bus[bus][dev][func];
     if(!device) return 0xffffffff;
 
@@ -214,7 +210,6 @@ PCI_BAR_INFO GetPciBarInfo(uint8_t bus, uint8_t dev, uint8_t func, uint32_t bar)
     return pbi;
 }
 
-
 static uint8_t PciGetHeaderType(uint8_t bus, uint8_t dev, uint8_t func){
     uint32_t val = PciConfigRead32(bus, dev, func, 0x0c);
     return (val >> 16) & 0x7f;
@@ -225,9 +220,30 @@ static uint8_t PciGetSecondaryBus(uint8_t bus, uint8_t dev, uint8_t func){
     return (val >> 8) & 0xff;
 }
 
-//callback function
-void OnPciDeviceFound(uint8_t bus, uint8_t dev, uint8_t func);
+//Access bar memory and perform read and write and give access to upper layer through APIs chain
+void* PciGetBarMemory(uint8_t bus, uint8_t dev, uint8_t func,
+                      int bar_index){
+    return PciSimGetBarMemory(bus, dev, func, bar_index);
+}
 
+uint64_t PciReadBar(uint8_t bus, uint8_t dev, uint8_t func,
+                    int bar_index, uint64_t offset, int size){
+    return PciSimReadBar(bus, dev, func, bar_index, offset, size);
+}
+
+void PciWriteBar(uint8_t bus, uint8_t dev, uint8_t func,
+                 int bar_index, uint64_t offset, uint64_t value, int size){
+    PciSimWriteBar(bus, dev, func, bar_index, offset, value, size);
+}
+
+//callback function
+static fPciDeviceCallback gPciDeviceCallback = NULL;
+
+void PciSetDeviceCallback(fPciDeviceCallback fpdc){
+    gPciDeviceCallback = fpdc;
+}
+
+//To do: func for 0x80 need check for host controller
 static void PciScanBus(uint8_t bus){
     for(int dev = 0; dev < MAX_DEVICE; dev++){ 
         for(int func = 0; func < MAX_FUNCTION; func++){
@@ -242,8 +258,9 @@ static void PciScanBus(uint8_t bus){
             LOG_INFO("PCI DEVICE FOUND");
             LOG_INFO_FMT("Bus=%d, Dev= %d, func= %d", bus, dev, func);
 
-            //callback hook
-            OnPciDeviceFound(bus, dev, func);
+            if(gPciDeviceCallback){
+                gPciDeviceCallback(bus, dev, func);
+            }
             
             uint8_t header = PciGetHeaderType(bus, dev, func);
             if(header == 1){

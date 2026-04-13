@@ -1,20 +1,42 @@
 
-#pragma once
+#ifndef pci_logic_h
+#define pci_logic_h
 
-#include "pci_sim.h"
+#ifdef __cplusplus
+extern "C" {
+#endif
+    
+#include "pci_sim.h"  
 #include <stdint.h>
 
-typedef struct _PCI_BAR_INFO PCI_BAR_INFO;
+    typedef struct _PCI_BAR_INFO PCI_BAR_INFO;
+    
+    typedef void (*fPciDeviceCallback)(uint8_t bus, uint8_t dev, uint8_t func);
 
-uint16_t PciReadVendor(uint8_t bus, uint8_t dev, uint8_t func);
+    uint16_t PciReadVendor(uint8_t bus, uint8_t dev, uint8_t func);
 
-uint32_t PciConfigRead32(uint8_t bus, uint8_t dev, uint8_t func, uint8_t offset);
+    uint32_t PciConfigRead32(uint8_t bus, uint8_t dev, uint8_t func, uint8_t offset);
 
-uint32_t PciConfigWrite32(uint8_t bus, uint8_t dev, uint8_t func,
-                          uint8_t offset, uint32_t value);
+    uint32_t PciConfigWrite32(uint8_t bus, uint8_t dev, uint8_t func,
+                              uint8_t offset, uint32_t value);
 
-PCI_BAR_INFO GetPciBarInfo(uint8_t bus, uint8_t dev, uint8_t func, uint32_t bar);
+    PCI_BAR_INFO GetPciBarInfo(uint8_t bus, uint8_t dev, uint8_t func, uint32_t bar);
 
-void OnPciDeviceFound(uint8_t bus, uint8_t dev, uint8_t func);
+    void* PciGetBarMemory(uint8_t bus, uint8_t dev, uint8_t func,
+                         int bar_index);
+    
+    uint64_t PciReadBar(uint8_t bus, uint8_t dev, uint8_t func,
+                    int bar_index, uint64_t offset, int size);
 
-void PciEnumerate();
+    void PciWriteBar(uint8_t bus, uint8_t dev, uint8_t func,
+                     int bar_index, uint64_t offset, uint64_t value, int size);
+    
+    void PciSetDeviceCallback(fPciDeviceCallback fpdc);
+    
+    void PciEnumerate();
+
+#ifdef _cplusplus
+}
+#endif
+
+#endif

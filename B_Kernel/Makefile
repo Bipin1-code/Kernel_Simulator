@@ -1,12 +1,11 @@
 
 # List directories where modules are present
-MODULES = bus common hw device
+MODULES = . bus common hw device drivers
 
 CC = gcc
 CFLAGS = -Wall -Werror -Wextra -std=c11 $(addprefix -I, $(MODULES)) -MMD -MP
 TARGET = testKrl
 
-SOURCES = main.c
 SOURCES += $(foreach dir,$(MODULES),$(wildcard $(dir)/*.c))
 
 OBJECTS = $(SOURCES:.c=.o)

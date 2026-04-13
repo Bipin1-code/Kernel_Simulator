@@ -1,9 +1,12 @@
 
 #include "pci_sim.h"
+#include "pci_sim_internal.h"
 #include "log.h"
 #include <stdio.h>
 #include <stdint.h>
 #include <stdlib.h>
+#include <string.h>
+#include <inttypes.h>
 
 #define MAX_BUS 2   //256 in real but for test it's 2
 #define MAX_DEVICE 32
@@ -72,6 +75,7 @@ typedef struct _PCI_HEADER_TYPE1{
 typedef struct _PCI_DEVICE{
     PCI_CONFIG_SPACE config;
     uint64_t bar_size[6]; //hardware internal address decode circuitry mimic
+    uint8_t *bar_mem[6];  //this is the actual memory base address
 } PCI_DEVICE;
 #pragma pack(pop)
 
@@ -141,9 +145,18 @@ static void SetupType0Header(PCI_DEVICE *device, uint16_t id, BAR_CFG *bars){
         if(bars[i].size == 0){
             type->bar[i] = 0;
             device->bar_size[i] = 0;
+            device->bar_mem[i] = NULL;
             continue;
         }
         device->bar_size[i] = bars[i].size;
+        device->bar_mem[i] = malloc(bars[i].size);
+        memset(device->bar_mem[i], 0, bars[i].size);
+
+        if(!device->bar_mem[i]){
+            LOG_ERROR_FMT("Failed to allocate BAR%d memory", i);
+            return;
+        }
+
         uint32_t flags = 0;
         if(bars[i].is_io){
             flags |= 0x1;
@@ -153,7 +166,10 @@ static void SetupType0Header(PCI_DEVICE *device, uint16_t id, BAR_CFG *bars){
             if(bars[i].is_64)
                 flags |= (2 << 1);
         }
+
         type->bar[i] = flags;
+        
+        //for 64-bit BAR, handling
         if(bars[i].is_64){
             i++;
             type->bar[i] = 0;
@@ -186,9 +202,18 @@ static void SetupType1Header(PCI_DEVICE *device, uint16_t mmL, BAR_CFG *bars){
         if(bars[i].size == 0){
             type->bar[i] = 0;
             device->bar_size[i] = 0;
+            device->bar_mem[i] = NULL;
             continue;
         }
         device->bar_size[i] = bars[i].size;
+        device->bar_mem[i] = malloc(bars[i].size);
+        memset(device->bar_mem[i], 0, bars[i].size);
+        
+        if(!device->bar_mem[i]){
+            LOG_ERROR_FMT("Failed to allocate BAR%d memory", i);
+            return;
+        }
+        
         uint32_t flags = 0;
         if(bars[i].is_io){
             flags |= 0x1;
@@ -199,6 +224,7 @@ static void SetupType1Header(PCI_DEVICE *device, uint16_t mmL, BAR_CFG *bars){
                 flags |= (2 << 1);
         }
         type->bar[i] = flags;
+        
         if(bars[i].is_64){
             i++;
             type->bar[i] = 0;
@@ -247,6 +273,7 @@ static PCI_DEVICE* CreateFakeDevice(const char *name, uint8_t type, uint8_t subc
     return device;
 }
 
+//These below functions are APIs for upper layers
 uint8_t* PciSimGetConfig(uint8_t bus, uint8_t dev, uint8_t func){
     PCI_DEVICE *device = g_pci_bus[bus][dev][func];
     if(!device) return NULL;
@@ -261,6 +288,64 @@ uint64_t PciSimGetBarSize(uint8_t bus, uint8_t dev, uint8_t func,
         return 0;
 
     return device->bar_size[bar_index];
+}
+
+void* PciSimGetBarMemory(uint8_t bus, uint8_t dev, uint8_t func,
+                         int bar_index){
+    PCI_DEVICE *device = g_pci_bus[bus][dev][func];
+    if(!device) return NULL;
+    if(bar_index < 0 || bar_index >= 6) return NULL;
+    return device->bar_mem[bar_index];
+}
+
+uint64_t PciSimReadBar(uint8_t bus, uint8_t dev, uint8_t func,
+                       int bar_index, uint64_t offset, int size){
+    uint8_t *mem = PciSimGetBarMemory(bus, dev, func, bar_index);
+    uint64_t bar_size = PciSimGetBarSize(bus, dev, func, bar_index);
+
+    if(!mem || ((offset + size) > bar_size)){
+        LOG_ERROR_FMT("BAR read out of bounds:bar=%d, offset=0x%" PRIx64 ", size=%d",
+                      bar_index, offset, size);
+        return 0;
+    }
+    switch(size){
+        case 1: return *(uint8_t *)(mem + offset);
+        case 2: return *(uint16_t *)(mem + offset);
+        case 4: return *(uint32_t *)(mem + offset);
+        case 8: return *(uint64_t *)(mem + offset);
+        default:
+            LOG_ERROR_FMT("INVALID read size: %d", size);
+            return 0;
+    }
+
+}
+
+void PciSimWriteBar(uint8_t bus, uint8_t dev, uint8_t func,
+                    int bar_index, uint64_t offset, uint64_t value, int size){
+    uint8_t *mem = PciSimGetBarMemory(bus, dev, func, bar_index);
+    uint64_t bar_size = PciSimGetBarSize(bus, dev, func, bar_index);
+
+    if(!mem || ((offset + size) > bar_size)){
+        LOG_ERROR_FMT("BAR write out of bounds: bar=%d, offset=0x%" PRIx64 ", size=%d",
+                      bar_index, offset, size);
+        return;
+    }
+    switch(size){
+        case 1:
+            *(uint8_t *)(mem + offset) = (uint8_t)value;
+            break;
+        case 2:
+            *(uint16_t *)(mem + offset) = (uint16_t)value;
+            break;
+        case 4:
+            *(uint32_t *)(mem + offset) = (uint32_t)value;
+            break;
+        case 8:
+            *(uint64_t *)(mem + offset) = value;
+            break;
+        default:
+            LOG_ERROR_FMT("INVALID write size: %d", size);
+    }
 }
 
 void PciDevicePool(){
