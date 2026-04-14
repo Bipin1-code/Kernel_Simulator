@@ -221,6 +221,33 @@ static uint8_t PciGetSecondaryBus(uint8_t bus, uint8_t dev, uint8_t func){
 }
 
 //Access bar memory and perform read and write and give access to upper layer through APIs chain
+
+void PciSetBarAddress(uint8_t bus, uint8_t dev, uint8_t func,
+                      int bar_index, uint64_t address){
+    uint8_t offset = 0x10 + bar_index * 4;
+    uint32_t orig = PciConfigRead32(bus, dev, func, offset);
+
+    if(orig & 0x1){
+        uint32_t io_addr = (uint32_t)(address & 0xfffffffC);
+        uint32_t value = io_addr | (orig & 0x3);
+        PciConfigWrite32(bus, dev, func, offset, value);
+    }else{
+        uint32_t type = (orig >> 1) & 0x3;
+        if(type == 0x2){
+            uint32_t low_addr = (uint32_t)(address & 0xfffffff0);
+            uint32_t high_addr = (uint32_t)(address >> 32);
+            uint32_t value = low_addr | (orig & 0xf);
+            PciConfigWrite32(bus, dev, func, offset, value);
+            value = high_addr;
+            PciConfigWrite32(bus, dev, func, offset + 4, value);
+        }else{
+            uint32_t mem_addr = (uint32_t)(address & 0xfffffff0);
+            uint32_t value = mem_addr | (orig & 0xf);
+            PciConfigWrite32(bus, dev, func, offset, value);
+        }
+    }
+}
+
 void* PciGetBarMemory(uint8_t bus, uint8_t dev, uint8_t func,
                       int bar_index){
     return PciSimGetBarMemory(bus, dev, func, bar_index);

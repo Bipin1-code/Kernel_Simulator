@@ -20,6 +20,9 @@ extern "C" {
     uint32_t PciConfigWrite32(uint8_t bus, uint8_t dev, uint8_t func,
                               uint8_t offset, uint32_t value);
 
+    void PciSetBarAddress(uint8_t bus, uint8_t dev, uint8_t func,
+                          int bar_index, uint64_t address);
+    
     PCI_BAR_INFO GetPciBarInfo(uint8_t bus, uint8_t dev, uint8_t func, uint32_t bar);
 
     void* PciGetBarMemory(uint8_t bus, uint8_t dev, uint8_t func,

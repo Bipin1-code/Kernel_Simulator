@@ -9,6 +9,40 @@
 PCI_DEVICE_CONTEXT *g_pciDevCtx[MAX_REAL_DEVICE];
 int g_dev_count = 0;
 
+static uint64_t gNextMimoAddr = 0xf0000000; //start of MMIO region
+static uint64_t gNextIoAddr = 0x1000;  //start of IO port region
+
+static uint64_t AllocateMmioAddress(uint64_t size){
+    uint64_t addr = (gNextMimoAddr + size - 1) & ~(size - 1);
+    gNextMimoAddr = addr + size;
+    return addr;
+}
+
+static uint64_t AllocateIoAddress(uint64_t size){
+    uint64_t addr = gNextIoAddr;
+    gNextIoAddr += size;
+    return addr;
+}
+
+static void AssignBarAddress(PCI_DEVICE_CONTEXT *ctx){
+    for(int i = 0; i < 6; i++){
+        if(ctx->bar_info[i].size == 0) continue;
+
+        uint64_t addr;
+        if(ctx->bar_info[i].is_io){
+            addr = AllocateIoAddress(ctx->bar_info->size);
+        }else{
+            addr = AllocateMmioAddress(ctx->bar_info->size);
+        }
+
+        PciSetBarAddress(ctx->bus, ctx->dev, ctx->func, i, addr);
+        ctx->bar_info[i].base_address = addr;
+
+        LOG_INFO_FMT("Assigned BAR%d address: 0x%" PRIx64, i, addr);
+    }
+}
+
+
 static void (*fgNewDeviceNotifier)(PCI_DEVICE_CONTEXT *device) = NULL;
 
 void OS_RegisterDeviceFoundCallback(void (*callback)(PCI_DEVICE_CONTEXT *)){
@@ -76,16 +110,21 @@ PCI_DEVICE_CONTEXT* DeviceCreateFromPci(const uint8_t bus, const uint8_t dev,
             b++;
             continue;
         }
+
+        AssignBarAddress(dev_ctx);
+        
         //Debug  start
         printf("BAR%d\n", b);
         if(bi.is_64bit) printf(" (64-bit)\n");
         printf(" Type: %s\n", bi.is_io ? "IO" : "Memory");
+        printf("Address: 0x%" PRIx64 "\n", dev_ctx->bar_info[b].base_address);
         printf(" Address: 0x%" PRIx64 "\n", bi.base_address);
         printf(" Size: 0x%" PRIx64 " (%" PRIu64 " bytes)\n", bi.size, bi.size);
         //Debug end
         
         b += (bi.is_64bit) ? 2 : 1;
     }
+
 
     //These are also debug print lines
     printf("Vendor: 0x%04X Device: 0x%04X\n", dev_ctx->vendor_id, dev_ctx->device_id);
