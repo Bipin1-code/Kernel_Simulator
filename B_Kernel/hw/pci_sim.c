@@ -76,6 +76,10 @@ typedef struct _PCI_DEVICE{
     PCI_CONFIG_SPACE config;
     uint64_t bar_size[6]; //hardware internal address decode circuitry mimic
     uint8_t *bar_mem[6];  //this is the actual memory base address
+
+    int discovery_active; //1 if in discovery mode
+    uint32_t discovery_mask_low[6];
+    uint32_t discovery_mask_high[6];
 } PCI_DEVICE;
 #pragma pack(pop)
 
@@ -100,9 +104,13 @@ static PCI_DEVICE* CreatePciDevice(const char *name){
     for(int byte = 0; byte < 256; byte++)
         device->config.data[byte] = 0;
 
-    for(int i = 0; i < 6; i++)
+    for(int i = 0; i < 6; i++){
         device->bar_size[i] = 0;
-    
+        device->discovery_mask_low[i] = 0;
+        device->discovery_mask_high[i] = 0;
+    }
+
+    device->discovery_active = 0;    
     return device;
 }
 
@@ -151,12 +159,12 @@ static void SetupType0Header(PCI_DEVICE *device, uint16_t id, BAR_CFG *bars){
         device->bar_size[i] = bars[i].size;
         device->bar_mem[i] = malloc(bars[i].size);
         memset(device->bar_mem[i], 0, bars[i].size);
-
+        
         if(!device->bar_mem[i]){
             LOG_ERROR_FMT("Failed to allocate BAR%d memory", i);
             return;
         }
-
+        
         uint32_t flags = 0;
         if(bars[i].is_io){
             flags |= 0x1;
@@ -166,16 +174,14 @@ static void SetupType0Header(PCI_DEVICE *device, uint16_t id, BAR_CFG *bars){
             if(bars[i].is_64)
                 flags |= (2 << 1);
         }
-
-        type->bar[i] = flags;
         
+        type->bar[i] = flags; 
         //for 64-bit BAR, handling
         if(bars[i].is_64){
             i++;
             type->bar[i] = 0;
         }
     }
-
     type->carbus_cis_ptr = 0x00; 
     type->subsystem_vendor_id = id;
     type->subsystem_id = id;
@@ -198,13 +204,17 @@ static void SetupType1Header(PCI_DEVICE *device, uint16_t mmL, BAR_CFG *bars){
     uint8_t *data = device->config.data;
     PCI_HEADER_TYPE1 *type = (PCI_HEADER_TYPE1 *)(data + 0x10);
 
+    for(int i = 0; i < 6; i++){
+        uint32_t *bar_reg = (uint32_t *)(data + 0x10 + i * 4);
+        *bar_reg = 0;
+        device->bar_size[i] = 0;
+        device->bar_mem[i] = NULL;
+    }
+
     for(int i = 0; i < 2; i++){
-        if(bars[i].size == 0){
-            type->bar[i] = 0;
-            device->bar_size[i] = 0;
-            device->bar_mem[i] = NULL;
+        if(bars[i].size == 0)
             continue;
-        }
+        
         device->bar_size[i] = bars[i].size;
         device->bar_mem[i] = malloc(bars[i].size);
         memset(device->bar_mem[i], 0, bars[i].size);
@@ -272,6 +282,68 @@ static PCI_DEVICE* CreateFakeDevice(const char *name, uint8_t type, uint8_t subc
     
     return device;
 }
+
+void PciSimSetDiscoveryMode(uint8_t bus, uint8_t dev, uint8_t func, int active){
+    if(bus >= MAX_BUS || dev >= MAX_DEVICE || func >= MAX_FUNCTION) return;
+    PCI_DEVICE *device = g_pci_bus[bus][dev][func];
+    if(device){
+        device->discovery_active = active;
+    }
+}
+
+int PciSimGetDiscoveryMode(uint8_t bus, uint8_t dev, uint8_t func){
+    if(bus >= MAX_BUS || dev >= MAX_DEVICE || func >= MAX_FUNCTION) return 0;
+    PCI_DEVICE *device = g_pci_bus[bus][dev][func];
+    return device ? device->discovery_active : 0;
+}
+
+void PciSimSetDiscoveryMaskLow(uint8_t bus, uint8_t dev, uint8_t func,
+                               int bar_index, uint32_t mask){
+    if(bus >= MAX_BUS || dev >= MAX_DEVICE || func >= MAX_FUNCTION) return;
+    if(bar_index < 0 || bar_index >= 6) return;
+    PCI_DEVICE *device = g_pci_bus[bus][dev][func];
+    if(device){
+        device->discovery_mask_low[bar_index] = mask;
+    }
+}
+
+void PciSimSetDiscoveryMaskHigh(uint8_t bus, uint8_t dev, uint8_t func,
+                                int bar_index, uint32_t mask){
+    if(bus >= MAX_BUS || dev >= MAX_DEVICE || func >= MAX_FUNCTION) return;
+    if(bar_index < 0 || bar_index >= 6) return;
+    PCI_DEVICE *device = g_pci_bus[bus][dev][func];
+    if(device)
+        device->discovery_mask_high[bar_index] = mask;
+}
+
+uint32_t PciSimGetDiscoveryMaskLow(uint8_t bus, uint8_t dev, uint8_t func,
+                                   int bar_index){
+    if(bus >= MAX_BUS || dev >= MAX_DEVICE || func >= MAX_FUNCTION) return 0;
+    if(bar_index < 0 || bar_index >= 6) return 0;
+    PCI_DEVICE *device = g_pci_bus[bus][dev][func];
+    return device ? device->discovery_mask_low[bar_index] : 0;
+}
+
+uint32_t PciSimGetDiscoveryMaskHigh(uint8_t bus, uint8_t dev, uint8_t func,
+                                   int bar_index){
+    if(bus >= MAX_BUS || dev >= MAX_DEVICE || func >= MAX_FUNCTION) return 0;
+    if(bar_index < 0 || bar_index >= 6) return 0;
+    PCI_DEVICE *device = g_pci_bus[bus][dev][func];
+    return device ? device->discovery_mask_high[bar_index] : 0;
+}
+
+void PciSimClearDiscovery(uint8_t bus, uint8_t dev, uint8_t func){
+    if(bus >= MAX_BUS || dev >= MAX_DEVICE || func >= MAX_FUNCTION) return;
+    PCI_DEVICE *device = g_pci_bus[bus][dev][func];
+    if(device){
+        device->discovery_active = 0;
+        for(int i = 0; i < 6; i++){
+            device->discovery_mask_low[i] = 0;
+            device->discovery_mask_high[i] = 0;
+        }
+    }
+}
+
 
 //These below functions are APIs for upper layers
 uint8_t* PciSimGetConfig(uint8_t bus, uint8_t dev, uint8_t func){

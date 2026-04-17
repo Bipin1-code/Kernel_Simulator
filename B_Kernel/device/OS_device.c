@@ -118,7 +118,7 @@ PCI_DEVICE_CONTEXT* DeviceCreateFromPci(const uint8_t bus, const uint8_t dev,
         if(bi.is_64bit) printf(" (64-bit)\n");
         printf(" Type: %s\n", bi.is_io ? "IO" : "Memory");
         printf("Address: 0x%" PRIx64 "\n", dev_ctx->bar_info[b].base_address);
-        printf(" Address: 0x%" PRIx64 "\n", bi.base_address);
+        printf(" Address: 0x%" PRIx64 "\n", bi.base_address); //this make sure host is assigning the BAR as expected
         printf(" Size: 0x%" PRIx64 " (%" PRIu64 " bytes)\n", bi.size, bi.size);
         //Debug end
         
