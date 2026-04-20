@@ -1,5 +1,6 @@
 
 #include "OS_device.h"
+#include "pci_logic.h"
 #include "log.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -42,7 +43,6 @@ static void AssignBarAddress(PCI_DEVICE_CONTEXT *ctx){
     }
 }
 
-
 static void (*fgNewDeviceNotifier)(PCI_DEVICE_CONTEXT *device) = NULL;
 
 void OS_RegisterDeviceFoundCallback(void (*callback)(PCI_DEVICE_CONTEXT *)){
@@ -65,6 +65,26 @@ static uint64_t DeviceBarRead(PCI_DEVICE_CONTEXT *ctx, int bar, uint64_t offset,
 static void DeviceBarWrite(PCI_DEVICE_CONTEXT *ctx, int bar, uint64_t offset,
                            uint64_t value, int size){
     PciWriteBar(ctx->bus, ctx->dev, ctx->func, bar, offset, value, size);
+}
+
+static void BarChangeHandler(uint8_t bus, uint8_t dev, uint8_t func,
+                             int bar_index, uint64_t new_address){
+    for(int i = 0; i < g_dev_count; i++){
+        PCI_DEVICE_CONTEXT *ctx = g_pciDevCtx[i];
+        if(ctx && (ctx->bus == bus) &&
+           (ctx->dev == dev) &&
+           (ctx->func == func)){
+            //update the cached address
+            ctx->bar_info[bar_index].base_address = new_address;
+            printf("[OS] Updated cached BAR%d address to 0x%" PRIx64 "\n",
+                   bar_index, new_address);
+            break;
+        }
+    }
+}
+
+void OS_InitPciCallbacks(void){
+    PciRegisterBarChangeCallback(BarChangeHandler);
 }
 
 PCI_DEVICE_CONTEXT* DeviceCreateFromPci(const uint8_t bus, const uint8_t dev,

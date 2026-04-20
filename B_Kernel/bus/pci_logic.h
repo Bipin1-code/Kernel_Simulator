@@ -13,6 +13,11 @@ extern "C" {
     
     typedef void (*fPciDeviceCallback)(uint8_t bus, uint8_t dev, uint8_t func);
 
+    typedef void (*fPciBarChangeCallback)(uint8_t bus, uint8_t dev, uint8_t func,
+                                          int bar_index, uint64_t new_address);
+
+    void PciRegisterBarChangeCallback(fPciBarChangeCallback callback);
+    
     uint16_t PciReadVendor(uint8_t bus, uint8_t dev, uint8_t func);
 
     uint32_t PciConfigRead32(uint8_t bus, uint8_t dev, uint8_t func, uint8_t offset);
@@ -35,6 +40,12 @@ extern "C" {
                      int bar_index, uint64_t offset, uint64_t value, int size);
     
     void PciSetDeviceCallback(fPciDeviceCallback fpdc);
+
+    int PciValidateAccess(uint8_t bus, uint8_t dev, uint8_t func,
+                          uint64_t address, int is_io);
+
+    int PciBridgeValidateForward(uint8_t bus, uint8_t dev, uint8_t func,
+                                uint64_t address, int is_io);
     
     void PciEnumerate();
 

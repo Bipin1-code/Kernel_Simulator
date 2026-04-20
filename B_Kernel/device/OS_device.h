@@ -52,9 +52,13 @@ extern "C" {
     extern int g_dev_count;
     
     PCI_DEVICE_CONTEXT* DeviceCreateFromPci(uint8_t bus, uint8_t dev, uint8_t func);
+
     void OS_HandleNewPciDevice(uint8_t bus, uint8_t dev, uint8_t func);
+    
     void OS_RegisterDeviceFoundCallback(void (*callback)(PCI_DEVICE_CONTEXT *));
 
+    void OS_InitPciCallbacks(void);
+    
 #ifdef __cplusplus
 }
 #endif

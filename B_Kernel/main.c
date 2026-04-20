@@ -12,6 +12,7 @@ int main(){
     printf("\n[SETUP] Initializing PCI simulator...\n");
     PciDevicePool();
     DriverPool();
+    OS_InitPciCallbacks();
     DriverFrameworkInit();
     PciSetDeviceCallback(OS_HandleNewPciDevice);
     PciEnumerate();

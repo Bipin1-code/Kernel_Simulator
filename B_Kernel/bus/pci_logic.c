@@ -14,6 +14,25 @@ typedef struct _PCI_BAR_INFO{
     uint8_t is_64bit;
 } PCI_BAR_INFO;
 
+//callback function
+static fPciDeviceCallback gPciDeviceCallback = NULL;
+
+void PciSetDeviceCallback(fPciDeviceCallback fpdc){
+    gPciDeviceCallback = fpdc;
+}
+
+static fPciBarChangeCallback gPciBarChangeCallback = NULL;
+void PciRegisterBarChangeCallback(fPciBarChangeCallback callback){
+    gPciBarChangeCallback = callback;
+}
+
+static void NotifyBarChange(uint8_t bus, uint8_t dev, uint8_t func,
+                            int bar_index, uint64_t new_address){
+    if(gPciBarChangeCallback){
+        gPciBarChangeCallback(bus, dev, func, bar_index, new_address);
+    }
+}
+
 //Core
 uint16_t PciReadVendor(uint8_t bus, uint8_t dev, uint8_t func){
     PCI_DEVICE *device = g_pci_bus[bus][dev][func];
@@ -66,7 +85,8 @@ uint32_t PciConfigWrite32(uint8_t bus, uint8_t dev, uint8_t func,
         LOG_WARN("[TRACE] Device not found!");
         return 0xffffffff;
     }
-    uint8_t *begin_data = PciSimGetConfig(bus, dev, func); 
+    uint8_t *begin_data = PciSimGetConfig(bus, dev, func);
+    int is_high_dword = ((offset - 0x10) % 8 == 4) && (offset > 0x10);
 
     //command register (low_offset=0x04 and high_offset= 0x06)
     if((offset == 0x04) || ((offset >= 0x04) && (offset < 0x08))){
@@ -79,7 +99,7 @@ uint32_t PciConfigWrite32(uint8_t bus, uint8_t dev, uint8_t func,
             return 0;
         }
         //device-specific supported bits mask
-        uint16_t supported_mask = GetDeviceCommandMask(device);
+        uint16_t supported_mask = PciSimGetDeviceCommandMask(device);
         uint16_t writeable_bits = supported_mask;
 
         //Reserved bits always read as 0, ignore write
@@ -100,7 +120,7 @@ uint32_t PciConfigWrite32(uint8_t bus, uint8_t dev, uint8_t func,
 
         return value;
     }
-    
+    int actual_bar;
     //bars
     if(offset >= 0x10 && offset < 0x28){
         /* Mapping config-space offset -> BAR index */
@@ -113,9 +133,9 @@ uint32_t PciConfigWrite32(uint8_t bus, uint8_t dev, uint8_t func,
                    bar_index, offset, value);
         }
                 
-        int is_high_dword = ((offset - 0x10) % 8 == 4) && (offset > 0x10);
+        // int is_high_dword = ((offset - 0x10) % 8 == 4) && (offset > 0x10);
         int is_64bit = 0;
-        int actual_bar = bar_index;
+        actual_bar = bar_index;
 
         if(is_high_dword){
             uint32_t low_value = *(uint32_t *)(begin_data + offset - 4);
@@ -183,6 +203,23 @@ uint32_t PciConfigWrite32(uint8_t bus, uint8_t dev, uint8_t func,
     uint32_t verify = *(uint32_t *)(PciSimGetConfig(bus, dev, func) + offset);
     if(offset >= 0x10 && offset < 0x28){
         printf("[DEBUG] BAR write verify: read back 0x%08X\n", verify);
+        if(!is_high_dword){
+            //Only notify on low dword; actual address change happens
+            uint64_t new_addr = 0;
+            uint32_t bar_low = *(uint32_t *)(begin_data + offset);
+            if(bar_low & 0x1){
+                new_addr = bar_low & ~0x3;
+            }else{
+                uint32_t type = (bar_low >> 1) & 0x3;
+                if(type == 2){
+                    uint32_t bar_high = *(uint32_t *)(begin_data + offset + 4);
+                    new_addr = ((uint64_t)bar_high << 32) | (bar_low & ~0xf);
+                }else{
+                    new_addr = bar_low & ~0xf;
+                }
+            }
+            NotifyBarChange(bus, dev, func, actual_bar, new_addr);
+        }
     }
     return 0;
 }
@@ -508,13 +545,6 @@ int PciBridgeValidateForward(uint8_t bus, uint8_t dev, uint8_t func,
     }                   
     printf("[DEBUG] Address 0x%" PRIx64 " NOT in any bridge window\n", address);
     return 0;
-}
-
-//callback function
-static fPciDeviceCallback gPciDeviceCallback = NULL;
-
-void PciSetDeviceCallback(fPciDeviceCallback fpdc){
-    gPciDeviceCallback = fpdc;
 }
 
 //To do: func for 0x80 need check for host controller

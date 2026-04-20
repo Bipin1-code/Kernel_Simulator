@@ -283,6 +283,33 @@ static PCI_DEVICE* CreateFakeDevice(const char *name, uint8_t type, uint8_t subc
     return device;
 }
 
+//These below functions are APIs for upper layers
+uint16_t PciSimGetDeviceCommandMask(PCI_DEVICE *dev){
+    uint8_t header_type = dev->config.data[0x0e] & 0x7f;
+    uint8_t class_code = dev->config.data[0xb];
+    //uint8_t subclass = dev->config.data[0xa];
+    uint16_t mask = PCI_CMD_SUPPORTED_BASIC; //(IO, MMIO, BUS master)
+
+    if(header_type == 1){
+        mask =  PCI_CMD_SUPPORTED_FULL;  //(mask + parityerr and serr#)
+    }
+    switch(class_code){
+        case 0x01:{
+            mask |= PCI_CMD_MWI_ENABLE;
+            break;
+        }
+        case 0x02:{
+            mask |= PCI_CMD_MWI_ENABLE;
+            break;
+        }
+        case 0x03:{
+            mask |= PCI_CMD_MWI_ENABLE | PCI_CMD_VGA_SNOOP;
+            break;
+        }
+    }
+    return mask;
+}
+
 void PciSimSetDiscoveryMode(uint8_t bus, uint8_t dev, uint8_t func, int active){
     if(bus >= MAX_BUS || dev >= MAX_DEVICE || func >= MAX_FUNCTION) return;
     PCI_DEVICE *device = g_pci_bus[bus][dev][func];
@@ -344,8 +371,6 @@ void PciSimClearDiscovery(uint8_t bus, uint8_t dev, uint8_t func){
     }
 }
 
-
-//These below functions are APIs for upper layers
 uint8_t* PciSimGetConfig(uint8_t bus, uint8_t dev, uint8_t func){
     PCI_DEVICE *device = g_pci_bus[bus][dev][func];
     if(!device) return NULL;

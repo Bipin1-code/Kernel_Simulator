@@ -1,5 +1,5 @@
 # List directories where modules are present
-MODULES =  bus common hw device drivers 
+MODULES =  bus common hw device drivers mmio 
 
 KERNEL_MODULES = . $(MODULES)
 
