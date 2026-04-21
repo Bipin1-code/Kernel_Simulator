@@ -12,45 +12,6 @@ extern PCI_DEVICE_CONTEXT *g_pciDevCtx[];
 extern int g_dev_count;
 
 //Private Functions
-static MMIO_ERROR ValidateAccess(MMIO_MATCH *match, uint64_t phys_addr,
-                                 int size_bytes){
-    if(!match){
-        return MMIO_ERR_NO_DEVICE;
-    }
-    //Bound checking
-    if(match->offset + size_bytes > match->bar_size){
-        printf("[MMIO] ERROR: Access crosses BAR boundary! ");
-        printf("offset=0x%" PRIx64 "size=%d bar_size=0x%" PRIx64 "\n",
-               match->offset, size_bytes, match->bar_size);
-        return MMIO_ERR_BOUNDS;
-    }
-    //Alignment checking
-    if(!match->is_io_space){
-        bool aligned = true;
-        switch(size_bytes){
-            case 1: break; //byte access always aligned
-            case 2:
-                aligned = ((phys_addr & 1) == 0);
-                break;
-            case 4:
-                aligned = ((phys_addr & 3) == 0);
-                break;
-            case 8:
-                aligned = ((phys_addr & 7) == 0);
-                break;
-            default:
-                printf("[MMIO] ERROR: Invalid access size %d\n", size_bytes);
-                return MMIO_ERR_ALIGNMENT;
-        }
-        if(!aligned){
-            printf("[MMIO] ERROR: Misaligned %d-byte access at 0x%" PRIx64 "\n",
-                   size_bytes, phys_addr);
-            return MMIO_ERR_ALIGNMENT;
-        }
-    }
-    return MMIO_VALID;
-}
-
 static bool IsDeviceEnabled(PCI_DEVICE_CONTEXT *ctx, bool is_io_space){
     uint32_t cmd = PciConfigRead32(ctx->bus, ctx->dev, ctx->func, 0x04);
     uint16_t command = cmd & 0xffff;
@@ -187,8 +148,7 @@ static bool BridgeForwardsAddress(PCI_DEVICE_CONTEXT *bridge, uint64_t phys_addr
 static bool ScanBusForDevice(uint8_t bus, uint64_t phys_addr, bool is_io_space,
                              MMIO_MATCH *match){
      printf("[MMIO] Scanning bus %d for addr=0x%" PRIx64 "\n", bus, phys_addr);
-     bool found_one = false;
-     
+
      //scaning all devices on this bus
      for(int i = 0; i < g_dev_count; i++){
          PCI_DEVICE_CONTEXT *ctx = g_pciDevCtx[i];
@@ -202,34 +162,25 @@ static bool ScanBusForDevice(uint8_t bus, uint64_t phys_addr, bool is_io_space,
              printf("[MMIO] Device disabled - skipping\n");
              continue;
          }       
-
-         bool claimed = false;
-         MMIO_MATCH temp_match = {0};
          
          if(ctx->header_type == 1){
              printf("[MMIO] THIS IS A BRIDGE\n");
              //Nested bridge -recursively check 
-             claimed = (BridgeForwardsAddress(ctx, phys_addr, is_io_space, &temp_match)) ||
-                 (EndpointClaimsAddress(ctx, phys_addr, is_io_space, &temp_match));
+             if(BridgeForwardsAddress(ctx, phys_addr, is_io_space, match))
+                 return true;
+             
+             if(EndpointClaimsAddress(ctx, phys_addr, is_io_space, match)){
+                 printf("[MMIO Bridge BAR claimed!\n]");
+                 return true;
+             }
          }else{
-             claimed = (EndpointClaimsAddress(ctx, phys_addr, is_io_space, &temp_match));
-         }
-         if(claimed){
-             if(!found_one){
-                 *match = temp_match;
-                 found_one = true;
-             }else{
-                 printf("[MMIO] WARNING: Multiple decives claim address 0x%" PRIx64 "\n",
-                        phys_addr);
-                 printf("[MMIO] First! Bus=%d Dev=%d Func=%d BAR=%d \n",
-                        match->bus, match->dev, match->func, match->bar_index);
-                 printf("[MMIO] Second! Bus=%d Dev=%d Func=%d BAR=%d \n",
-                        temp_match.bus, temp_match.dev, temp_match.func,
-                        temp_match.bar_index);
+             if(EndpointClaimsAddress(ctx, phys_addr, is_io_space, match)){
+                 printf("[MMIO Endpoint BAR claimed!\n]");
+                 return true;
              }
          }
      }
-     return found_one;
+     return false;
 }
 
 static bool BridgeForwardsAddress(PCI_DEVICE_CONTEXT *bridge, uint64_t phys_addr,
@@ -279,13 +230,11 @@ static bool BridgeForwardsAddress(PCI_DEVICE_CONTEXT *bridge, uint64_t phys_addr
 MMIO_MATCH* MmioFindDevice(uint64_t phys_addr, bool is_io_space){
     MMIO_MATCH *match = (MMIO_MATCH *)calloc(1, sizeof(MMIO_MATCH));
     if(!match) return NULL;
-      
+
     printf("[MMIO] Finding device for addr=0x%" PRIx64 ", space=%s\n",
            phys_addr, is_io_space ? "I/O" : "Memory");
 
     if(ScanBusForDevice(0, phys_addr, is_io_space, match)){
-        //if this block execute then sec_match must be check first
-        //first match is the winner who take turkey dinner
         printf("[MMIO] Found! Bus=%d Dev=%d Func=%d BAR=%d offset=0x%" PRIx64 "\n",
                match->bus, match->dev, match->func,
                match->bar_index, match->offset);
@@ -295,7 +244,6 @@ MMIO_MATCH* MmioFindDevice(uint64_t phys_addr, bool is_io_space){
     printf("[MMIO] No device claimed address 0x%" PRIx64 "\n",
            phys_addr);
     free(match);
-
     return NULL;
 }
 
@@ -319,21 +267,12 @@ uint64_t MmioRouteRead(uint64_t phys_addr, int size_bytes){
     printf("[MMIO] READ: addr=0x%" PRIx64 " size=%d\n",
            phys_addr, size_bytes);
     MMIO_MATCH  *match = MmioFindDevice(phys_addr, false);
-    MMIO_ERROR err = ValidateAccess(match, phys_addr, size_bytes);
     if(!match){
         //PCI spec: reads to unmapped space return all 1s
         printf("[MIMO] No device, returning all 1s\n");
         return (size_bytes == 1) ? 0xff :
-               (size_bytes == 2) ? 0xffff :
-               (size_bytes == 4) ? 0xffffffff : 0xffffffffffffffffULL;
-    }
-    
-    if(err != MMIO_VALID){
-        if(match) free(match);
-        printf("[MMIO] Validation failed, returning all 1 's\n");
-        return (size_bytes == 1) ? 0xff :
-               (size_bytes == 2) ? 0xffff :
-               (size_bytes == 4) ? 0xffffffff : 0xffffffffffffffffULL;
+            (size_bytes == 2) ? 0xffff :
+            (size_bytes == 4) ? 0xffffffff: 0xffffffffffffffffULL;
     }
 
     PCI_DEVICE_CONTEXT *ctx = NULL;
@@ -361,15 +300,9 @@ void MmioRouteWrite(uint64_t phys_addr, uint64_t value, int size_bytes){
     printf("[MMIO] WRITE : addr=0x%" PRIx64 " value=0x%" PRIX64 " size=%d\n",
            phys_addr, value, size_bytes);
     MMIO_MATCH *match = MmioFindDevice(phys_addr, false);
-    MMIO_ERROR err = ValidateAccess(match, phys_addr, size_bytes);
-    
+
     if(!match){
         printf("[MMIO] No device, write dropped\n");
-        return;
-     }
-    if(err != MMIO_VALID){
-        if(match) free(match);
-        printf("[MMIO] Validation failed, write dropped\n");
         return;
     }
 

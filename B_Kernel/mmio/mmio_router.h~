@@ -9,15 +9,6 @@ extern "c" {
 #include <stdint.h>
 #include <stdbool.h>
 
-    //Access Validation
-    typedef enum{
-        MMIO_VALID = 0,
-        MMIO_ERR_BOUNDS,
-        MMIO_ERR_ALIGNMENT,
-        MMIO_ERR_MULTIPLE,
-        MMIO_ERR_NO_DEVICE
-    } MMIO_ERROR;
-
     typedef struct _MMIO_MATCH{
         uint8_t bus;
         uint8_t dev;
@@ -34,6 +25,7 @@ extern "c" {
     uint64_t MmioRouteRead(uint64_t phys_addr, int size_bytes);
     void MmioRouteWrite(uint64_t phys_addr, uint64_t value, int size_bytes);
 
+    //debug function
     MMIO_MATCH* MmioFindDevice(uint64_t phys_addr, bool is_io_space);
     void MmioPrintMatch(MMIO_MATCH *match);
     
