@@ -1,4 +1,4 @@
-
+ 
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
@@ -6,7 +6,10 @@
 #include <stdbool.h>
 
 #define EXP R15 //Dedicated Expected value register
-
+#define MAIN_MEMORY_SIZE 1024
+#define CACHE_LINES 8 //lines per core
+#define NUM_CORES 2
+#define CACHE_LINE_DATA_WORDS 2
 typedef uint32_t INS; 
 
 typedef enum _REGISTER{
@@ -35,6 +38,24 @@ typedef enum _OPCODE{
     HALT
 } OPCODE;
 
+typedef enum _MESI_STATE{
+    MESI_INVALID,
+    MESI_EXCLUSIVE,
+    MESI_SHARED,
+    MESI_MODIFIED
+} MESI_STATE;
+
+typedef struct _CACHE_LINE{
+    uint32_t address;
+    uint32_t data[CACHE_LINE_DATA_WORDS];
+    MESI_STATE state;
+    bool dirty;
+} CACHE_LINE;
+
+typedef struct _CACHE{
+    CACHE_LINE lines[CACHE_LINES];
+} CACHE;
+
 typedef struct _CORE{
     uint32_t regs[16];
     uint32_t pc;
@@ -53,12 +74,21 @@ typedef struct _CORE{
     uint16_t imm;
     uint32_t addr;
     uint32_t temp_val;
+
+    CACHE cache;
 } CORE;
 
 typedef struct _BUS{
-    uint8_t mem[1024];
+    uint8_t mem[MAIN_MEMORY_SIZE];
     bool locked;
-    int locked_owner;
+    uint32_t locked_owner;
+
+    bool bus_rd;
+    bool bus_rdx;
+    uint32_t snoop_addr; 
+    uint32_t snoop_core_id; 
+    uint32_t snoop_data[CACHE_LINE_DATA_WORDS]; //data from responding cache
+    bool snoop_hit; //Did any cache respond?
 } BUS;
 
 typedef void (*fHandler)(CORE *c, BUS *bus, INS unstr);
@@ -237,6 +267,7 @@ void CmpxChgFunction(CORE *c, BUS *bus, INS instr){
            c->zero_flag ? "SUCCESS" : "RETRY");
 }
 
+//OPCODE Function registeration 
 fHandler handlers[] = {
     [LOAD]     = LoadFunction,
     [STORE]    = StoreFunction,
@@ -253,6 +284,172 @@ fHandler handlers[] = {
     [CMPXCHG]  = CmpxChgFunction,
     [HALT]     = HaltFunction
 };
+
+//Cache associate functions
+
+void CacheSnoopOtherCores(CORE *all_c, int num_cores, uint32_t core_id,
+                          uint32_t addr, bool is_write, BUS *bus);
+
+//search cache for an address. Return index (0-7) or -1 if not found.
+int CacheFind(CACHE *cache, uint32_t addr){
+    uint32_t line_base = addr & ~(CACHE_LINES - 1);
+    for(int i = 0; i < CACHE_LINES; i++){
+        if((cache->lines[i].state != MESI_INVALID) &&
+           (cache->lines[i].address == line_base)){
+            return i;
+        }
+    }
+    return -1;
+}
+
+/* //old one but I will use it later for other test */
+/* //Pick a victim line. Write-back if dirty. Return the freed index. */
+/* int CacheEvict(CORE *c, BUS *bus){ */
+/*     static int victim = 0; */
+/*     int idx = victim; */
+/*     victim = (victim + 1) % CACHE_LINES; //UPDATE THE VICTIM (DSA: RING array) */
+/*     CACHE_LINE *line = &c->cache.lines[idx]; */
+
+/*     if(line->state == MESI_MODIFIED){ */
+/*         *(uint32_t *)(&bus->mem[line->address]) = line->data; */
+/*     } */
+/*     line->state = MESI_INVALID; */
+/*     line->address = 0; */
+/*     return idx; */
+/* } */
+
+//new one 
+static void CacheEvictLine(CACHE *cache, BUS *bus, int idx){
+    if(cache->lines[idx].state == MESI_MODIFIED){
+        uint32_t base = cache->lines[idx].address;
+        for(int w = 0; w < CACHE_LINE_DATA_WORDS; w++){
+            *(uint32_t *)(&bus->mem[base + (w * 4)]) =
+                cache->lines[idx].data[w];
+        }
+    }
+    cache->lines[idx].state = MESI_INVALID;
+    cache->lines[idx].address = 0;
+}
+
+static int CacheGetEmpty(CACHE *cache, BUS *bus){
+    for(int i = 0; i < CACHE_LINES; i++){
+        if(cache->lines[i].state == MESI_INVALID) return i;
+    }
+    CacheEvictLine(cache, bus, 0);
+    return 0;
+}
+
+void CacheSnoop(CACHE *cache, uint32_t addr, bool is_write, BUS *bus){
+    int idx = CacheFind(cache, addr);
+    printf("  SNOOP core? addr=0x%X -> idx=%d\n", addr, idx);
+    if(idx == -1) return;
+    CACHE_LINE *line = &cache->lines[idx];
+    if(is_write){
+        //BusRdx: other cores wants exclusive write access
+        if(line->state == MESI_MODIFIED){
+            //must show the dirty data
+            for(int w = 0; w < CACHE_LINE_DATA_WORDS; w++){
+                bus->snoop_data[w] = line->data[w];
+            }
+            bus->snoop_hit = true;
+        }
+        line->state = MESI_INVALID;
+    }else{
+        //BusRd: other core wants to read
+        if(line->state != MESI_INVALID){
+            for(int w = 0; w < CACHE_LINE_DATA_WORDS; w++){
+                bus->snoop_data[w] = line->data[w];
+            }
+            bus->snoop_hit = true;
+        
+            if(line->state == MESI_MODIFIED){
+                line->state = MESI_SHARED;
+            }else if(line->state == MESI_EXCLUSIVE){
+                line->state = MESI_SHARED;
+            }
+        }
+    }
+}
+
+uint32_t CacheLoad(CORE *c, uint32_t addr, BUS *bus, CORE *all_c, int num_c){
+    int idx = CacheFind(&c->cache, addr);
+    printf("CORE %d: LOAD 0x%X -> idx=%d\n", c->core_id, addr, idx);
+    if(idx != -1){
+        /* return; */
+        //`chge
+        int word_offset = (addr & (CACHE_LINES - 1)) / 4;
+        return c->cache.lines[idx].data[word_offset];
+    }
+
+    //Miss - get a line
+    uint32_t line_base = addr & ~(CACHE_LINES - 1);
+    idx = CacheGetEmpty(&c->cache, bus); 
+    
+    //Broadcast BusRd on snoop bus
+    bus->bus_rd = true;
+    bus->bus_rdx = false;
+    bus->snoop_addr = addr;
+    bus->snoop_core_id = c->core_id;
+    bus->snoop_hit = false;
+    memset(bus->snoop_data, 0, sizeof(bus->snoop_data));
+
+    //`chg
+    CacheSnoopOtherCores(all_c, num_c, c->core_id, addr, false, bus);
+    
+    c->cache.lines[idx].address = line_base;
+    if(bus->snoop_hit){
+        //Another core supplied the data
+        for(int w = 0; w < CACHE_LINE_DATA_WORDS; w++){
+            c->cache.lines[idx].data[w] = bus->snoop_data[w]; 
+        }
+        c->cache.lines[idx].state = MESI_SHARED;
+    }else{
+        //No one has it - fetch from main memory
+         for(int w = 0; w < CACHE_LINE_DATA_WORDS; w++){
+             c->cache.lines[idx].data[w] =
+                 *(uint32_t *)(&bus->mem[line_base + (w * 4)]);
+        }     
+        c->cache.lines[idx].state = MESI_EXCLUSIVE; //this core only has it
+    }
+
+    /* return idx; */
+    //`chg
+    int word_offset = (addr & (CACHE_LINES -1)) / 4;
+    return c->cache.lines[idx].data[word_offset];
+}
+
+void CacheWrite(CORE *c, uint32_t addr, uint32_t value, BUS *bus,
+                CORE *all_c, int num_c){
+    int idx = CacheFind(&c->cache, addr);
+    if(idx == -1){
+        CacheLoad(c, addr, bus, all_c, num_c);
+        idx = CacheFind(&c->cache, addr);
+    }
+    CACHE_LINE *line = &c->cache.lines[idx];
+    if(line->state == MESI_SHARED){
+        printf("CORE %d: BusRdX broadcast for addr=0x%X (was SHARED)\n",
+               c->core_id, addr);
+        //mUST invalidate other copies first
+        bus->bus_rdx = true;
+        bus->bus_rd = false;
+        bus->snoop_addr = addr;
+        bus->snoop_hit = false;
+        bus->snoop_core_id = c->core_id;
+        //`chg
+        CacheSnoopOtherCores(all_c, num_c, c->core_id, addr, true, bus);
+    }
+    int word_offset = (addr & (CACHE_LINES -1)) / 4;
+    line->data[word_offset] = value;
+    line->state = MESI_MODIFIED;
+}
+
+void CacheSnoopOtherCores(CORE *all_c, int num_cores, uint32_t core_id,
+                          uint32_t addr, bool is_write, BUS *bus){
+    for(int i = 0; i < num_cores; i++){
+        if(i == (int)core_id) continue;
+        CacheSnoop(&all_c[i].cache, addr, is_write, bus);
+    }
+}
 
 /* This step function's Each Handler (OPCODE) is a mini atomic
    transaction by accident. That's not how silicon work.
@@ -288,11 +485,11 @@ fHandler handlers[] = {
   this function replicate the cpu-cycle, where
   one cycle = each core advances by exactly one
   micro-operation. Just like real silicon */
-void Step(CORE *c, BUS *bus, int core_id){
+void Step(CORE *c, BUS *bus, CORE *all_c){
     if(c->halted) return;
     
-    if(bus->locked && bus->locked_owner != core_id){
-        printf("Core %d stalled (bus locked)\n", core_id);
+    if(bus->locked && bus->locked_owner != c->core_id){
+        /* printf("Core %d stalled (bus locked)\n", c->core_id); */
         return;
     }
     switch(c->micro_op){
@@ -357,7 +554,9 @@ void Step(CORE *c, BUS *bus, int core_id){
             break;
         }
         case LOAD_MEM: {
-            c->temp_val = *(uint32_t *)(&bus->mem[c->addr]);
+            /* c->temp_val = *(uint32_t *)(&bus->mem[c->addr]); */
+            //`chg
+            c->temp_val = CacheLoad(c, c->addr, bus, all_c, NUM_CORES);
             c->micro_op = LOAD_WB;
             break;
         }
@@ -372,7 +571,9 @@ void Step(CORE *c, BUS *bus, int core_id){
             break;
         }
         case STORE_MEM: {
-            *(uint32_t *)(&bus->mem[c->addr]) = c->regs[c->dest];
+            /* *(uint32_t *)(&bus->mem[c->addr]) = c->regs[c->dest]; */
+            //`chg
+            CacheWrite(c, c->addr, c->regs[c->dest], bus, all_c, NUM_CORES);
             c->micro_op = FETCH;
             break;
         }
@@ -445,19 +646,23 @@ void Step(CORE *c, BUS *bus, int core_id){
         }
         case LOCK_INC_ADDR: {
             bus->locked = true;
-            bus->locked_owner = core_id;
+            bus->locked_owner = c->core_id;
             c->addr = (c->mode == 0) ? c->imm : c->regs[c->src];
             c->micro_op = LOCK_INC_LOAD;
             break;
         }
         case LOCK_INC_LOAD: {
-            c->temp_val = *(uint32_t *)(&bus->mem[c->addr]);
+            /* c->temp_val = *(uint32_t *)(&bus->mem[c->addr]); */
+            //`chg
+            c->temp_val = CacheLoad(c, c->addr, bus, all_c, NUM_CORES);
             c->micro_op = LOCK_INC_STORE;
             break;
         }
         case LOCK_INC_STORE: {
             c->temp_val++;
-            *(uint32_t *)(&bus->mem[c->addr]) = c->temp_val;
+            /* *(uint32_t *)(&bus->mem[c->addr]) = c->temp_val; */
+            //`chg
+            CacheWrite(c, c->addr, c->temp_val, bus, all_c, NUM_CORES);
             bus->locked = false;
             bus->locked_owner = -1;
             c->micro_op = FETCH;
@@ -465,13 +670,15 @@ void Step(CORE *c, BUS *bus, int core_id){
         }
         case CMPXCHG_ADDR: {
             bus->locked = true;
-            bus->locked_owner = core_id;
+            bus->locked_owner = c->core_id;
             c->addr = (c->mode == 0) ? c->imm : c->regs[c->src];
             c->micro_op = CMPXCHG_LOAD;
             break;
         }
         case CMPXCHG_LOAD: {
-            c->temp_val = *(uint32_t *)(&bus->mem[c->addr]);
+            /* c->temp_val = *(uint32_t *)(&bus->mem[c->addr]); */
+             //`chg
+            c->temp_val = CacheLoad(c, c->addr, bus, all_c, NUM_CORES);
             c->micro_op = CMPXCHG_COMPARE;
             break;
         }
@@ -486,7 +693,9 @@ void Step(CORE *c, BUS *bus, int core_id){
             break;
         }
         case CMPXCHG_STORE: {
-            *(uint32_t *)(&bus->mem[c->addr]) = c->regs[c->dest];
+            /* *(uint32_t *)(&bus->mem[c->addr]) = c->regs[c->dest]; */
+            //`chg
+            CacheWrite(c, c->addr, c->regs[c->dest], bus, all_c, NUM_CORES);
             c->zero_flag = 1;
             bus->locked = false;
             bus->locked_owner = -1;
@@ -510,69 +719,114 @@ void Step(CORE *c, BUS *bus, int core_id){
     }
 }
 
+void PrintCache(CORE *c){
+    printf("Core %d cache:\n", c->core_id);
+    for(int i = 0; i < CACHE_LINES; i++){
+        if(c->cache.lines[i].state != MESI_INVALID){
+            char state_char = 'I';
+            if(c->cache.lines[i].state == MESI_EXCLUSIVE){
+                state_char = 'E';
+            }
+            if(c->cache.lines[i].state == MESI_SHARED){
+                state_char = 'S';
+            }
+            if(c->cache.lines[i].state == MESI_MODIFIED){
+                state_char = 'M';
+            }
+            printf(" [%d] addr= 0x%X data=[%d, %d] state=%c\n",
+                   i, c->cache.lines[i].address,
+                   c->cache.lines[i].data[0],
+                   c->cache.lines[i].data[1],
+                   state_char);
+        }
+    }
+}
+
 int main(){
     BUS bus = {0};
-    CORE core0 = {0};
-    core0.core_id = 123;
-    CORE core1 = {0};
-    core1.core_id = 321;
-    
-    INS program[] = {
-        // R0 = address of counter (0x300)
-        Encode(LIC,  R0,  0, 0, 0x300),
-
-        // R1 = loop counter (10)
+    CORE cores[NUM_CORES] = {0};
+   
+    cores[0].core_id = 123;
+    cores[1].core_id = 321;
+    // Core 0: increments ONLY word at 0x300 (first word in line)
+    INS program_core0[] = {
+        Encode(LIC,  R0,  0, 0, 0x300),   // my counter
         Encode(LIC,  R1,  0, 0, 10),
-
-        // R2 = constant 1
         Encode(LIC,  R2,  0, 0, 1),
-
-        // R3 = constant 0 (for CMP)
         Encode(LIC,  R3,  0, 0, 0),
-
-        // --- loop start (0x10) ---
-        // Load current counter into EXP (expected)
-        Encode(LOAD,  EXP, R0, 1, 0),        // EXP = mem[counter]
-
-        // --- retry point (0x14) ---
-
-        // R4 = EXP + 1 (new value)
-        Encode(LIC,   R4, 0, 0, 0),          // clear R4
-        Encode(ADD,   R4, EXP, 0, 0),        // R4 = EXP
-        Encode(ADD,   R4, R2, 0, 0),         // R4 = EXP + 1
-
-        // CMPXCHG [R0], R4
-        Encode(CMPXCHG, R4, R0, 1, 0),       // if mem[R0]==EXP -> mem[R0]=R4, ZF=1
-        // else EXP = mem[R0], ZF=0
-
-        // If failed, retry
-        Encode(JNE,  0, 0, 0, 0x14),         // jump back to retry point
-
-        // Success: decrement loop counter
-        Encode(SUB,   R1, R2, 0, 0),         // R1--
-        Encode(CMP,   R1, R3, 0, 0),         // R1 == 0?
-        Encode(JNE,   0, 0, 0, 0x10),        // back to loop start
-
-        
+        Encode(LOAD,  EXP, R0, 1, 0),       // 0x010
+        Encode(LIC,   R4, 0, 0, 0),         // 0x014
+        Encode(ADD,   R4, EXP, 0, 0),       // 0x018
+        Encode(ADD,   R4, R2, 0, 0),        // 0x01C
+        Encode(CMPXCHG, R4, R0, 1, 0),      // 0x020 <- touches 0x300
+        Encode(JNE,  0, 0, 0, 0x014),
+        Encode(SUB,   R1, R2, 0, 0),
+        Encode(CMP,   R1, R3, 0, 0),
+        Encode(JNE,   0, 0, 0, 0x010),
         Encode(HALT,  0, 0, 0, 0),
     };
 
-    memcpy(bus.mem, program, sizeof(program));
-    *(uint32_t *)(&bus.mem[0x300]) = 0;
+    // Core 1: increments ONLY word at 0x304 (second word in SAME cache line)
+    INS program_core1[] = {
+        Encode(LIC,  R0,  0, 0, 0x308),   // MY counter - different address! //put 304 for to see false share it's not accurate yet but it shows it
+        Encode(LIC,  R1,  0, 0, 10),
+        Encode(LIC,  R2,  0, 0, 1),
+        Encode(LIC,  R3,  0, 0, 0),
+        Encode(LOAD,  EXP, R0, 1, 0),       // 0x110
+        Encode(LIC,   R4, 0, 0, 0),
+        Encode(ADD,   R4, EXP, 0, 0),
+        Encode(ADD,   R4, R2, 0, 0),
+        Encode(CMPXCHG, R4, R0, 1, 0),      // 0x120 <- touches 0x304
+        Encode(JNE,  0, 0, 0, 0x114),
+        Encode(SUB,   R1, R2, 0, 0),
+        Encode(CMP,   R1, R3, 0, 0),
+        Encode(JNE,   0, 0, 0, 0x110),
+        Encode(HALT,  0, 0, 0, 0),
+    };
+    // Core 0: program at 0x000, counter at 0x300
+    memcpy(&bus.mem[0x000], program_core0, sizeof(program_core0));
+    *(uint32_t*)&bus.mem[0x300] = 0;
+    *(uint32_t*)&bus.mem[0x308] = 0;
+    cores[0].pc = 0x000;
 
+    // Core 1: program at 0x100, 
+    memcpy(&bus.mem[0x100], program_core1, sizeof(program_core1));
+    cores[1].pc = 0x100; 
+    
     int cycle = 0;
-    while(!core0.halted || !core1.halted){
-        Step(&core0, &bus, 123);
-        Step(&core1, &bus, 321);
+    while(!cores[0].halted || !cores[1].halted){
+        Step(&cores[0], &bus, cores);
+        Step(&cores[1], &bus, cores);
+        printf("\n\n Cycle[%d]: after CMPXCHG - ", cycle);
+        PrintCache(&cores[0]);
+        PrintCache(&cores[1]);
+        puts("\n");
         cycle++;
     }
+
+    puts("Loop end");
+    
+    // Flush all caches to memory
+    for(int i = 0; i < NUM_CORES; i++){
+        printf("Core %d cache:\n", cores[i].core_id);
+        for(int j = 0; j < CACHE_LINES; j++){
+            if(cores[i].cache.lines[j].state == MESI_MODIFIED){
+                uint32_t base = cores[i].cache.lines[j].address;
+                for(int w = 0; w < CACHE_LINE_DATA_WORDS; w++){
+                    *(uint32_t*)&bus.mem[base + (w * 4)] = 
+                        cores[i].cache.lines[j].data[w];
+                }
+            }
+        }
+    }
+
+    // Now read from memory
+    uint32_t counter = *(uint32_t*)&bus.mem[0x300];
+    printf("Counter = %d \n", counter);
     printf("Total cycles: %d\n", cycle);
-    printf("Counter = %d\n", *(uint32_t*)&bus.mem[0x300]);
-    //print expected and outcomes here
-    printf("EXP = %d, R0 = 0x%X, R1 = %d, R2 = %d, R3 = %d, R4 = %d\n",
-           core0.regs[EXP], core0.regs[R0],
-           core0.regs[R1], core0.regs[R2],
-           core0.regs[R3], core0.regs[R4]);
+
+    PrintCache(&cores[0]);
+    PrintCache(&cores[1]);
     
     return 0;
 }
