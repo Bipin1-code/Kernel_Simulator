@@ -10,6 +10,8 @@
 #define CACHE_LINES 8 //lines per core
 #define NUM_CORES 2
 #define CACHE_LINE_DATA_WORDS 2
+#define STORE_BUFFER_SIZE 4
+
 typedef uint32_t INS; 
 
 typedef enum _REGISTER{
@@ -28,6 +30,7 @@ typedef enum _MICRO_OP{
     JMP_EXEC, JEQ_EXEC, JNE_EXEC, JLT_EXEC, JGT_EXEC,
     LOCK_INC_ADDR, LOCK_INC_LOAD, LOCK_INC_STORE,
     CMPXCHG_ADDR, CMPXCHG_LOAD, CMPXCHG_COMPARE, CMPXCHG_STORE, CMPXCHG_FAIL,
+    FENCE_EXEC,
     HALT_EXEC
 } MICRO_OP; 
 
@@ -35,6 +38,7 @@ typedef enum _OPCODE{
     LOAD = 0, STORE, LIC, ADD, SUB,
     CMP, JMP, JEQ, JNE, JLT, JGT,
     LOCK_INC, CMPXCHG,
+    FENCE,
     HALT
 } OPCODE;
 
@@ -56,6 +60,19 @@ typedef struct _CACHE{
     CACHE_LINE lines[CACHE_LINES];
 } CACHE;
 
+typedef struct _STORE_BUFFER_ENTRY{
+    uint32_t addr;
+    uint32_t data;
+    bool valid;
+} STORE_BUFFER_ENTRY;
+
+typedef struct _STORE_BUFFER{
+    STORE_BUFFER_ENTRY entries[STORE_BUFFER_SIZE];
+    int head;
+    int tail;
+    int count;
+} STORE_BUFFER;
+
 typedef struct _CORE{
     uint32_t regs[16];
     uint32_t pc;
@@ -76,6 +93,7 @@ typedef struct _CORE{
     uint32_t temp_val;
 
     CACHE cache;
+    STORE_BUFFER store_buffer;
 } CORE;
 
 typedef struct _BUS{
@@ -132,14 +150,14 @@ void LoadFunction(CORE *c, BUS *bus, INS instr){
 
 void StoreFunction(CORE *c, BUS *bus, INS instr){
     uint8_t opc, val_reg, addr_reg, mode;
-   uint16_t imm;
-   Decode(instr, &opc, &val_reg, &addr_reg, &mode, &imm);
-   if(mode == 0){
-       *(uint32_t *)(&bus->mem[imm]) = c->regs[val_reg];   
-   }else{
-       uint32_t addr = c->regs[addr_reg];
-       *(uint32_t *)(&bus->mem[addr]) = c->regs[val_reg];
-   }
+    uint16_t imm;
+    Decode(instr, &opc, &val_reg, &addr_reg, &mode, &imm);
+    if(mode == 0){
+        *(uint32_t *)(&bus->mem[imm]) = c->regs[val_reg];   
+    }else{
+        uint32_t addr = c->regs[addr_reg];
+        *(uint32_t *)(&bus->mem[addr]) = c->regs[val_reg];
+    }
 }
 
 void LicFunction(CORE *c, BUS *bus, INS instr){
@@ -282,14 +300,63 @@ fHandler handlers[] = {
     [JGT]      = JgtFunction,
     [LOCK_INC] = LockIncFunction,
     [CMPXCHG]  = CmpxChgFunction,
+    /* [FENCE] */
     [HALT]     = HaltFunction
 };
 
-//Cache associate functions
+void CacheWriteDirect(CORE *c, uint32_t addr, uint32_t value,
+                      BUS *bus, CORE *all_c, int num_c);
 
 void CacheSnoopOtherCores(CORE *all_c, int num_cores, uint32_t core_id,
                           uint32_t addr, bool is_write, BUS *bus);
 
+//Store Buffer functions
+void StoreBufferPush(CORE *c, uint32_t addr, uint32_t data){
+
+    //Debug if Block
+    if (c->core_id == 321 && addr == 0x300) {
+        printf("!!! PUSH on Core 321: addr=0x300 value=%d\n", data);
+    }
+    
+    if(c->store_buffer.count >= STORE_BUFFER_SIZE){
+        printf("Core %d: Store buffer full, forced drain\n",
+               c->core_id);
+        return;
+    }
+    int tail = c->store_buffer.tail;
+    STORE_BUFFER_ENTRY *entry = &c->store_buffer.entries[tail];
+    entry->addr = addr;
+    entry->data = data;
+    entry->valid = true;
+    c->store_buffer.tail = (tail + 1) % STORE_BUFFER_SIZE;
+
+    c->store_buffer.count++;
+}
+
+void DrainStoreBuffer(CORE *c, BUS *bus, CORE *all_c, int num_c){
+    if(c->store_buffer.count == 0) return;
+
+    printf("[Debug:]!!! CORE %d: Draining store buffer entry: addr=0x%X value=%d\n",
+           c->core_id, 
+           c->store_buffer.entries[c->store_buffer.head].addr,
+           c->store_buffer.entries[c->store_buffer.head].data);
+    
+    
+    int head = c->store_buffer.head;    
+    STORE_BUFFER_ENTRY *entry = &c->store_buffer.entries[head];
+    CacheWriteDirect(c, entry->addr, entry->data, bus, all_c, num_c);
+    entry->valid = false;
+    c->store_buffer.head = (head + 1) % STORE_BUFFER_SIZE;
+    c->store_buffer.count--;
+}
+
+void FlushStoreBuffer(CORE *c, BUS *bus, CORE *all_c, int num_c){
+    while(c->store_buffer.count > 0){
+        DrainStoreBuffer(c, bus, all_c, num_c);
+    }
+}
+
+//Cache associate functions
 //search cache for an address. Return index (0-7) or -1 if not found.
 int CacheFind(CACHE *cache, uint32_t addr){
     uint32_t line_base = addr & ~(CACHE_LINES - 1);
@@ -393,6 +460,12 @@ uint32_t CacheLoad(CORE *c, uint32_t addr, BUS *bus, CORE *all_c, int num_c){
     bus->snoop_hit = false;
     memset(bus->snoop_data, 0, sizeof(bus->snoop_data));
 
+    //Debug if block
+    if (c->core_id == 321 && addr == 0x300) {
+        printf("!!! CORE 321 CacheLoad 0x300: data[0]=%d, snoop_hit=%d\n",
+               c->cache.lines[idx].data[0], bus->snoop_hit);
+    }
+
     //`chg
     CacheSnoopOtherCores(all_c, num_c, c->core_id, addr, false, bus);
     
@@ -405,9 +478,9 @@ uint32_t CacheLoad(CORE *c, uint32_t addr, BUS *bus, CORE *all_c, int num_c){
         c->cache.lines[idx].state = MESI_SHARED;
     }else{
         //No one has it - fetch from main memory
-         for(int w = 0; w < CACHE_LINE_DATA_WORDS; w++){
-             c->cache.lines[idx].data[w] =
-                 *(uint32_t *)(&bus->mem[line_base + (w * 4)]);
+        for(int w = 0; w < CACHE_LINE_DATA_WORDS; w++){
+            c->cache.lines[idx].data[w] =
+                *(uint32_t *)(&bus->mem[line_base + (w * 4)]);
         }     
         c->cache.lines[idx].state = MESI_EXCLUSIVE; //this core only has it
     }
@@ -418,8 +491,14 @@ uint32_t CacheLoad(CORE *c, uint32_t addr, BUS *bus, CORE *all_c, int num_c){
     return c->cache.lines[idx].data[word_offset];
 }
 
-void CacheWrite(CORE *c, uint32_t addr, uint32_t value, BUS *bus,
-                CORE *all_c, int num_c){
+void CacheWriteDirect(CORE *c, uint32_t addr, uint32_t value,
+                      BUS *bus, CORE *all_c, int num_c){
+    //Debug block
+    if (c->core_id == 321 && addr == 0x300) {
+        printf("!!! CORE 321 CacheWriteDirect 0x300: value=%d\n", value);
+        // print backtrace
+    }
+    
     int idx = CacheFind(&c->cache, addr);
     if(idx == -1){
         CacheLoad(c, addr, bus, all_c, num_c);
@@ -438,9 +517,17 @@ void CacheWrite(CORE *c, uint32_t addr, uint32_t value, BUS *bus,
         //`chg
         CacheSnoopOtherCores(all_c, num_c, c->core_id, addr, true, bus);
     }
-    int word_offset = (addr & (CACHE_LINES -1)) / 4;
+    int word_offset = (addr & (CACHE_LINES - 1)) / 4;
     line->data[word_offset] = value;
     line->state = MESI_MODIFIED;
+}
+
+void CacheWrite(CORE *c, uint32_t addr, uint32_t value,
+                BUS *bus, CORE *all_c, int num_c){
+    (void)bus;
+    (void)all_c;
+    (void)num_c;
+    StoreBufferPush(c, addr, value);
 }
 
 void CacheSnoopOtherCores(CORE *all_c, int num_cores, uint32_t core_id,
@@ -450,6 +537,7 @@ void CacheSnoopOtherCores(CORE *all_c, int num_cores, uint32_t core_id,
         CacheSnoop(&all_c[i].cache, addr, is_write, bus);
     }
 }
+
 
 /* This step function's Each Handler (OPCODE) is a mini atomic
    transaction by accident. That's not how silicon work.
@@ -481,20 +569,41 @@ void CacheSnoopOtherCores(CORE *all_c, int num_cores, uint32_t core_id,
 /*     /\*     bus->locked_owner = -1; *\/ */
 /* } */
 
-/*This step function doesn't need above function it's all in one
+/*
+  This step function doesn't need above function it's all in one
   this function replicate the cpu-cycle, where
   one cycle = each core advances by exactly one
-  micro-operation. Just like real silicon */
+  micro-operation. Just like real silicon.
+*/
 void Step(CORE *c, BUS *bus, CORE *all_c){
     if(c->halted) return;
+    
+    // CATCH THE BUG
+    if(c->core_id == 1 && c->micro_op == STORE_MEM) {
+        printf("!!! CORE 1 STORE_MEM: addr=0x%X value=%d\n",
+               c->addr, c->regs[c->dest]);
+    }
+    if(c->core_id == 1 && c->micro_op == CMPXCHG_STORE) {
+        printf("!!! CORE 1 CMPXCHG_STORE: addr=0x%X value=%d\n",
+               c->addr, c->regs[c->dest]);
+    }
+    if(c->core_id == 1 && c->micro_op == LOCK_INC_STORE) {
+        printf("!!! CORE 1 LOCK_INC_STORE: addr=0x%X\n", c->addr);
+    }
     
     if(bus->locked && bus->locked_owner != c->core_id){
         /* printf("Core %d stalled (bus locked)\n", c->core_id); */
         return;
     }
+
+    //    DrainStoreBuffer(c, bus, all_c, NUM_CORES);
     switch(c->micro_op){
         case FETCH: {
             c->current_instr = *(INS *)(&bus->mem[c->pc]);
+            if (c->core_id == 1) {
+                uint8_t opc = (c->current_instr >> 24) & 0xFF;
+                printf("!!! CORE 1 FETCH: pc=0x%X, opcode=%d\n", c->pc, opc);
+            }
             c->pc += 4;
             c->micro_op = DECODE;
             break;
@@ -542,6 +651,9 @@ void Step(CORE *c, BUS *bus, CORE *all_c){
                 case CMPXCHG:
                     c->micro_op = CMPXCHG_ADDR;
                     break;
+                case FENCE:
+                    c->micro_op = FENCE_EXEC;
+                    break;
                 case HALT:
                     c->micro_op = HALT_EXEC;
                     break;
@@ -557,11 +669,19 @@ void Step(CORE *c, BUS *bus, CORE *all_c){
             /* c->temp_val = *(uint32_t *)(&bus->mem[c->addr]); */
             //`chg
             c->temp_val = CacheLoad(c, c->addr, bus, all_c, NUM_CORES);
+            if (c->core_id == 321 && c->addr == 0x300) {
+                printf("!!! CORE 321: LOAD_MEM for 0x300 got temp_val=%d\n",
+                       c->temp_val);
+            }
             c->micro_op = LOAD_WB;
             break;
         }
         case LOAD_WB: {
             c->regs[c->dest] = c->temp_val;
+            if (c->core_id == 321 && c->dest == R4) {
+                printf("!!! CORE 321: LOAD_WB storing %d to R4\n",
+                       c->temp_val);
+            }
             c->micro_op = FETCH;
             break;
         }
@@ -677,7 +797,7 @@ void Step(CORE *c, BUS *bus, CORE *all_c){
         }
         case CMPXCHG_LOAD: {
             /* c->temp_val = *(uint32_t *)(&bus->mem[c->addr]); */
-             //`chg
+            //`chg
             c->temp_val = CacheLoad(c, c->addr, bus, all_c, NUM_CORES);
             c->micro_op = CMPXCHG_COMPARE;
             break;
@@ -705,6 +825,11 @@ void Step(CORE *c, BUS *bus, CORE *all_c){
         case CMPXCHG_FAIL: {
             bus->locked = false;
             bus->locked_owner = -1;
+            c->micro_op = FETCH;
+            break;
+        }
+        case FENCE_EXEC: {
+            FlushStoreBuffer(c, bus, all_c, NUM_CORES);
             c->micro_op = FETCH;
             break;
         }
@@ -745,51 +870,39 @@ void PrintCache(CORE *c){
 int main(){
     BUS bus = {0};
     CORE cores[NUM_CORES] = {0};
-   
-    cores[0].core_id = 123;
-    cores[1].core_id = 321;
-    // Core 0: increments ONLY word at 0x300 (first word in line)
+    cores[0].core_id = 0;
+    cores[1].core_id = 1;
+
+    // Core 0: writes data=42 to 0x300, then flag=1 to 0x308
     INS program_core0[] = {
-        Encode(LIC,  R0,  0, 0, 0x300),   // my counter
-        Encode(LIC,  R1,  0, 0, 10),
-        Encode(LIC,  R2,  0, 0, 1),
-        Encode(LIC,  R3,  0, 0, 0),
-        Encode(LOAD,  EXP, R0, 1, 0),       // 0x010
-        Encode(LIC,   R4, 0, 0, 0),         // 0x014
-        Encode(ADD,   R4, EXP, 0, 0),       // 0x018
-        Encode(ADD,   R4, R2, 0, 0),        // 0x01C
-        Encode(CMPXCHG, R4, R0, 1, 0),      // 0x020 <- touches 0x300
-        Encode(JNE,  0, 0, 0, 0x014),
-        Encode(SUB,   R1, R2, 0, 0),
-        Encode(CMP,   R1, R3, 0, 0),
-        Encode(JNE,   0, 0, 0, 0x010),
-        Encode(HALT,  0, 0, 0, 0),
+        Encode(LIC,  R0, 0, 0, 0x300),
+        Encode(LIC,  R1, 0, 0, 0x308),
+        Encode(LIC,  R2, 0, 0, 42),
+        Encode(LIC,  R3, 0, 0, 1),
+        Encode(STORE, R2, R0, 1, 0),     // [0x300] = 42
+        Encode(FENCE, 0, 0, 0, 0),
+        Encode(STORE, R3, R1, 1, 0),     // [0x308] = 1
+        Encode(FENCE, 0, 0, 0, 0),
+        Encode(HALT, 0, 0, 0, 0),
+    };
+    // Core 1: spins until flag==1, then reads data
+    INS program_core1[] = {
+        Encode(LIC,  R0, 0, 0, 0x308),   // flag addr
+        Encode(LIC,  R1, 0, 0, 0x300),   // data addr
+        Encode(LIC,  R2, 0, 0, 0),
+        // loop start = 0x10C
+        Encode(LOAD,  R3, R0, 1, 0),     // load flag
+        Encode(CMP,   R3, R2, 0, 0),
+        Encode(JEQ,   0, 0, 0, 0x10C),   // <- FIX: jump to 0x10C, not 0x0C!
+        Encode(LOAD,  R4, R1, 1, 0),     // load data
+        Encode(HALT, 0, 0, 0, 0),
     };
 
-    // Core 1: increments ONLY word at 0x304 (second word in SAME cache line)
-    INS program_core1[] = {
-        Encode(LIC,  R0,  0, 0, 0x308),   // MY counter - different address! //put 304 for to see false share it's not accurate yet but it shows it
-        Encode(LIC,  R1,  0, 0, 10),
-        Encode(LIC,  R2,  0, 0, 1),
-        Encode(LIC,  R3,  0, 0, 0),
-        Encode(LOAD,  EXP, R0, 1, 0),       // 0x110
-        Encode(LIC,   R4, 0, 0, 0),
-        Encode(ADD,   R4, EXP, 0, 0),
-        Encode(ADD,   R4, R2, 0, 0),
-        Encode(CMPXCHG, R4, R0, 1, 0),      // 0x120 <- touches 0x304
-        Encode(JNE,  0, 0, 0, 0x114),
-        Encode(SUB,   R1, R2, 0, 0),
-        Encode(CMP,   R1, R3, 0, 0),
-        Encode(JNE,   0, 0, 0, 0x110),
-        Encode(HALT,  0, 0, 0, 0),
-    };
-    // Core 0: program at 0x000, counter at 0x300
     memcpy(&bus.mem[0x000], program_core0, sizeof(program_core0));
     *(uint32_t*)&bus.mem[0x300] = 0;
     *(uint32_t*)&bus.mem[0x308] = 0;
     cores[0].pc = 0x000;
 
-    // Core 1: program at 0x100, 
     memcpy(&bus.mem[0x100], program_core1, sizeof(program_core1));
     cores[1].pc = 0x100; 
     
@@ -797,37 +910,26 @@ int main(){
     while(!cores[0].halted || !cores[1].halted){
         Step(&cores[0], &bus, cores);
         Step(&cores[1], &bus, cores);
-        printf("\n\n Cycle[%d]: after CMPXCHG - ", cycle);
-        PrintCache(&cores[0]);
-        PrintCache(&cores[1]);
-        puts("\n");
         cycle++;
     }
 
-    puts("Loop end");
-    
-    // Flush all caches to memory
+    // Flush before reading
     for(int i = 0; i < NUM_CORES; i++){
-        printf("Core %d cache:\n", cores[i].core_id);
+        FlushStoreBuffer(&cores[i], &bus, cores, NUM_CORES);
+    }
+    for(int i = 0; i < NUM_CORES; i++){
         for(int j = 0; j < CACHE_LINES; j++){
             if(cores[i].cache.lines[j].state == MESI_MODIFIED){
                 uint32_t base = cores[i].cache.lines[j].address;
                 for(int w = 0; w < CACHE_LINE_DATA_WORDS; w++){
-                    *(uint32_t*)&bus.mem[base + (w * 4)] = 
-                        cores[i].cache.lines[j].data[w];
+                    *(uint32_t*)&bus.mem[base + w*4] = cores[i].cache.lines[j].data[w];
                 }
             }
         }
     }
 
-    // Now read from memory
-    uint32_t counter = *(uint32_t*)&bus.mem[0x300];
-    printf("Counter = %d \n", counter);
-    printf("Total cycles: %d\n", cycle);
-
-    PrintCache(&cores[0]);
-    PrintCache(&cores[1]);
-    
+    printf("R3 (flag) = %d\n", cores[1].regs[R3]);
+    printf("R4 (data) = %d (expected 42)\n", cores[1].regs[R4]);
+    printf("Cycles: %d\n", cycle);
     return 0;
 }
- 
